@@ -4,6 +4,12 @@
 
   var APP_NAME = document.body.getAttribute('data-app-name') || 'なかまボード';
   var ICON_URL = document.body.getAttribute('data-icon-url') || '';
+  // 提供元の表記（アプリ名を変えても、この表記は残します）
+  var PRODUCT = { name: 'なかまボード', tagline: '無料で使える、仲間の連絡・共有ボード', version: '1.0.0',
+    provider: 'ユーカリデジタル', url: 'https://eucalydigital.com/' };
+  function creditHtml() {
+    return '<div class="credit">' + esc(PRODUCT.name) + '｜' + esc(PRODUCT.tagline) + '<br>提供：<a href="' + PRODUCT.url + '" target="_blank" rel="noopener">' + esc(PRODUCT.provider) + '</a></div>';
+  }
   var $app = document.getElementById('app');
   var $overlay = document.getElementById('overlay');
   var $toast = document.getElementById('toast');
@@ -42,7 +48,7 @@
     inbox: null,
     chat: null,         // { convId, data, files, sending }
     chatBack: null,
-    // 区域カード
+    // 共有カード
     terr: null,         // { isAdmin, dueDays, cards }
     terrCard: null,     // 表示中のカードの詳細
     terrTab: 'map',
@@ -205,6 +211,9 @@
     undo: '<path d="M9 14 4 9l5-5"></path><path d="M4 9h11a5 5 0 0 1 0 10h-3"></path>',
     warn: '<path d="M12 3 2 20h20z"></path><path d="M12 10v4M12 17h.01"></path>',
     eraser: '<path d="M16 3.5 20.5 8a1.5 1.5 0 0 1 0 2.1L11 19.6H6.5L3.5 16.6a1.5 1.5 0 0 1 0-2.1L13.9 3.5a1.5 1.5 0 0 1 2.1 0z"></path><path d="M9 9l6.5 6.5"></path><path d="M11 19.6h9"></path>',
+    star: '<path d="M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1-4.4-4.3 6.1-.9z"></path>',
+    folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>',
+    link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"></path><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"></path>',
     open: '<path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"></path>',
     history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path><path d="M3 3v5h5"></path><path d="M12 7v5l3 3"></path>',
     send: '<path d="M4 12 20 4l-6 16-3-7z"></path>',
@@ -226,7 +235,7 @@
     if (ink.dirty) { clearTimeout(ink.saveTimer); saveInk(); }
     // オフになっている機能の画面には入らない
     var needs = { board: 'board', post: 'board', compose: 'board', calendar: 'calendar', event: 'calendar', eventForm: 'calendar',
-      inbox: 'chat', chat: 'chat', groups: 'groups', group: 'groups', groupForm: 'groups' };
+      inbox: 'chat', chat: 'chat', library: 'library', libItemForm: 'library', libShelves: 'library', groups: 'groups', group: 'groups', groupForm: 'groups' };
     var need = needs[screen] || (/^terr/.test(screen) || screen === 'territory' ? 'cards' : '');
     if (need && !featOn(need)) screen = 'home';
     state.screen = screen;
@@ -241,6 +250,7 @@
     if (screen === 'group') loadGroup();
     if (screen === 'territory') loadTerritories();
     if (screen === 'terrAdmin') loadTerritories();
+    if (screen === 'library' || screen === 'libShelves') loadLibrary();
   }
 
   function render() {
@@ -259,15 +269,18 @@
       case 'chat': html = shell(state.chat && state.chat.data ? state.chat.data.conv.title : 'トーク', viewChat(), 'inbox', { back: state.chatBack || 'inbox', noNav: true }); break;
       case 'pickUsers': html = shell(state.picker ? state.picker.title : '', viewPicker(), state.picker && state.picker.mode === 'dm' ? 'inbox' : 'menu', { back: state.picker ? state.picker.back : 'menu' }); break;
       case 'menu': html = shell('メニュー', viewMenu(), 'menu'); break;
+      case 'library': html = shell('資料箱', viewLibrary(), 'menu', { back: 'menu', right: state.lib && state.lib.canEdit ? '<button class="pill" data-go="libShelves">' + icon('gear', 16) + '棚</button>' : '' }); break;
+      case 'libShelves': html = shell('棚の管理', viewLibShelves(), 'menu', { back: 'library' }); break;
+      case 'libItemForm': html = shell(state.libForm && state.libForm.item ? '資料を編集' : '資料を追加', viewLibItemForm(), 'menu', { back: 'library' }); break;
       case 'groups': html = shell('グループ', viewGroups(), 'menu', { back: 'menu', right: '<button class="pill" data-action="newGroup">' + icon('plus', 16) + '作成</button>' }); break;
       case 'group': html = shell(state.group ? state.group.group.name : 'グループ', viewGroup(), 'menu', { back: 'groups' }); break;
       case 'groupForm': html = shell(state.groupForm && state.groupForm.mode === 'edit' ? 'グループの設定' : 'グループを作成', viewGroupForm(), 'menu', { back: state.groupForm && state.groupForm.mode === 'edit' ? 'group' : 'groups' }); break;
-      case 'territory': html = shell('区域カード', viewTerritory(), 'territory', { right: state.terr && state.terr.isAdmin ? '<button class="pill" data-go="terrAdmin">' + icon('gear', 16) + '管理</button>' : '' }); break;
-      case 'terrCard': html = shell(state.terrCard ? terrTitle(state.terrCard) : '区域カード', viewTerrCard(), 'territory', { back: state.terrBack || 'territory' }); break;
-      case 'terrAdmin': html = shell('区域カードの管理', viewTerrAdmin(), 'territory', { back: 'territory' }); break;
+      case 'territory': html = shell('共有カード', viewTerritory(), 'territory', { right: state.terr && state.terr.isAdmin ? '<button class="pill" data-go="terrAdmin">' + icon('gear', 16) + '管理</button>' : '' }); break;
+      case 'terrCard': html = shell(state.terrCard ? terrTitle(state.terrCard) : '共有カード', viewTerrCard(), 'territory', { back: state.terrBack || 'territory' }); break;
+      case 'terrAdmin': html = shell('共有カードの管理', viewTerrAdmin(), 'territory', { back: 'territory' }); break;
       case 'terrLend': html = shell('代理で貸し出す', viewTerrLend(), 'territory', { back: 'terrCard' }); break;
       case 'terrHistory': html = shell('使用履歴', viewTerrHistory(), 'territory', { back: 'terrCard' }); break;
-      case 'terrEdit': html = shell(state.terrEdit && state.terrEdit.card ? (isList(state.terrEdit.card) ? 'リストを編集' : '区域カードを編集') : 'リストを登録', viewTerrEdit(), 'territory', { back: state.terrEdit && state.terrEdit.card ? 'terrCard' : 'terrAdmin' }); break;
+      case 'terrEdit': html = shell(state.terrEdit && state.terrEdit.card ? 'カードを編集' : (state.terrEdit && state.terrEdit.type === 'link' ? 'リンクを登録' : '表を登録'), viewTerrEdit(), 'territory', { back: state.terrEdit && state.terrEdit.card ? 'terrCard' : 'terrAdmin' }); break;
       case 'account': html = shell('アカウント', viewAccount(), 'menu', { back: 'menu' }); break;
       case 'admin': html = shell('全体の管理', viewAdmin(), 'menu', { back: 'menu' }); break;
       default: html = '<div class="loading"><div class="spinner"></div><div>読み込み中…</div></div>';
@@ -279,7 +292,7 @@
   }
 
   // アプリ全体の機能のオン・オフ（全体管理者が「アプリ設定」で決める）
-  var FEATURE_NAMES = { board: '掲示板', calendar: '予定（カレンダー）', chat: 'メッセージ', groups: 'グループ', cards: '共有カード' };
+  var FEATURE_NAMES = { board: '掲示板', calendar: '予定（カレンダー）', chat: 'メッセージ', groups: 'グループ', cards: '共有カード', library: '資料箱' };
   function featOn(f) {
     var fs = state.user && state.user.features;
     return !fs || fs[f] !== false;
@@ -287,7 +300,7 @@
 
   function shell(title, body, active, opts) {
     opts = opts || {};
-    var items = [['home', 'home', 'ホーム'], ['board', 'board', '掲示板', 'board'], ['inbox', 'chat', 'メッセージ', 'chat'], ['calendar', 'cal', '予定', 'calendar'], ['territory', 'map', '区域', 'cards'], ['menu', 'menu', 'メニュー']]
+    var items = [['home', 'home', 'ホーム'], ['board', 'board', '掲示板', 'board'], ['inbox', 'chat', 'メッセージ', 'chat'], ['calendar', 'cal', '予定', 'calendar'], ['territory', 'map', 'カード', 'cards'], ['menu', 'menu', 'メニュー']]
       .filter(function (it) { return !it[3] || featOn(it[3]); });
     var ts = state.summary.territory;
     var counts = { board: totalUnread(), inbox: state.summary.chatUnread || 0, territory: ts && ts.alerts ? ts.alerts.length : 0 };
@@ -319,6 +332,7 @@
       '</form>' +
       '<div class="stack center"><div class="muted small">はじめての方</div>' +
       '<button class="btn outline block" data-go="register">招待コードで登録</button></div>' +
+      creditHtml() +
     '</div>';
   }
 
@@ -344,7 +358,7 @@
     var s = state.summary;
     var badges = '';
     if (u.role === 'admin') badges += ' <span class="tag admin">全体管理者</span>';
-    if (u.territoryAdmin) badges += ' <span class="tag terr">区域カード管理者</span>';
+    if (u.territoryAdmin) badges += ' <span class="tag terr">共有カード管理者</span>';
     if (u.calendarEditor && u.role !== 'admin') badges += ' <span class="tag cal">カレンダー編集者</span>';
 
     var notices = s.notices.length
@@ -360,13 +374,13 @@
       : '<div class="muted small" style="padding:8px 0">7日以内の予定はありません</div>';
 
     var ts = s.territory || { holding: 0, alerts: [] };
-    var soon = '<button class="tile link" data-go="territory"><div class="label">区域カード</div><div class="num">' + (ts.holding || 0) + '<span class="small muted" style="font-weight:400"> 枚を借りています</span></div></button>';
+    var soon = '<button class="tile link" data-go="territory"><div class="label">共有カード</div><div class="num">' + (ts.holding || 0) + '<span class="small muted" style="font-weight:400"> 枚を借りています</span></div></button>';
     var terrAlerts = (ts.alerts || []).map(function (a) {
       var msg = a.kind === 'return' ? '貸出対象外になりました。返却をお願いします'
         : a.kind === 'overdue' ? '返却期限（' + fmtShortDay(a.dueDate) + '）を過ぎています'
         : '返却期限（' + fmtShortDay(a.dueDate) + '）が近づいています';
       return '<button class="notice terr-alert" data-action="openTerr" data-id="' + esc(a.id) + '">' + icon('warn', 18) +
-        '<span><b>区域 ' + a.number + (a.name ? ' ' + esc(a.name) : '') + '</b><br>' + msg + '</span></button>';
+        '<span><b>No.' + a.number + (a.name ? ' ' + esc(a.name) : '') + '</b><br>' + msg + '</span></button>';
     }).join('');
 
     var admin = isAdmin()
@@ -376,7 +390,8 @@
     var tiles = (featOn('board') ? '<button class="tile link" data-go="board"><div class="label">掲示板</div><div class="num">' + (s.unread.board || 0) + '<span class="small muted" style="font-weight:400"> 件の未読</span></div></button>' : '') +
       (featOn('chat') ? '<button class="tile link" data-go="inbox"><div class="label">メッセージ</div><div class="num">' + (s.chatUnread || 0) + '<span class="small muted" style="font-weight:400"> 件の未読</span></div></button>' : '') +
       (featOn('groups') ? '<button class="tile link" data-go="groups"><div class="label">グループ</div><div class="num">' + (s.groupCount || 0) + '<span class="small muted" style="font-weight:400"> 件に参加</span></div></button>' : '') +
-      (featOn('cards') ? soon : '');
+      (featOn('cards') ? soon : '') +
+      (featOn('library') ? '<button class="tile link" data-go="library"><div class="label">資料箱</div><div class="num" style="font-size:15px">' + icon('folder', 18) + ' 開く</div></button>' : '');
     return '<div class="muted">' + esc(u.name) + 'さん、こんにちは' + badges + '</div>' + (featOn('cards') ? terrAlerts : '') +
       (featOn('board') ? '<div class="card"><div style="display:flex;justify-content:space-between;align-items:baseline">' +
         '<div class="section-title">お知らせ</div><button class="linkbtn" data-action="toNotices">すべて見る</button></div>' +
@@ -836,10 +851,109 @@
         icon('next', 18) + '</button>';
     };
     return '<div class="card menu-list">' +
+      (featOn('library') ? item('library', 'folder', '資料箱', 'マニュアル・規程・よく使うリンク') : '') +
       (featOn('groups') ? item('groups', 'group', 'グループ', (state.summary.groupCount || 0) + 'グループに参加中') : '') +
       item('account', 'user', 'アカウント', 'プロフィール・パスワード・ログアウト') +
       (isAdmin() ? item('admin', 'gear', 'メンバー管理', '招待コード・権限・アプリの設定') : '') +
+    '</div>' +
+    '<div class="card about stack">' +
+      '<div class="about-head"><b>' + esc(PRODUCT.name) + '</b><span class="muted small">バージョン ' + PRODUCT.version + '</span></div>' +
+      '<div class="muted small">' + esc(PRODUCT.tagline) + '。Googleのサービスだけで動き、データはこのアプリを設置した人のGoogleドライブに保存されます。</div>' +
+      '<div class="small">提供：<a href="' + PRODUCT.url + '" target="_blank" rel="noopener">' + esc(PRODUCT.provider) + '</a></div>' +
+      '<div class="muted small">機能の追加・カスタマイズ・設置の代行のご相談は、ユーカリデジタルまでお気軽にどうぞ（有料・別途ご相談）。</div>' +
+      '<a class="btn outline block" href="' + PRODUCT.url + '" target="_blank" rel="noopener">' + icon('open', 16) + 'ユーカリデジタルのサイトを見る</a>' +
     '</div>';
+  }
+
+  // ---------- 資料箱 ----------
+  function loadLibrary() {
+    state.lib = state.lib || cache.get('lib');
+    render();
+    return call('api_library', state.token).then(function (r) {
+      state.lib = r;
+      cache.set('lib', r);
+      if (state.screen === 'library' || state.screen === 'libShelves') render();
+    }, handleError);
+  }
+
+  function libItemRow(it, canEdit) {
+    var ic = it.kind === 'link' ? icon('link', 20) : ficon(it.file && isImage(it.file) ? 'img' : 'pdf', 20);
+    var main = '<span class="lib-icon">' + ic + '</span><span class="lib-text"><span class="lib-title">' + (it.pinned ? '<span class="lib-star">' + icon('star', 14) + '</span>' : '') + esc(it.title) + '</span>' +
+      (it.note ? '<span class="muted small">' + esc(it.note) + '</span>' : '') + '</span>';
+    var open = it.kind === 'link'
+      ? '<a class="lib-open" href="' + esc(it.url) + '" target="_blank" rel="noopener">' + main + '</a>'
+      : (it.file ? '<button type="button" class="lib-open" data-action="viewFile" data-id="' + esc(it.file.id) + '">' + main + '</button>'
+        : '<span class="lib-open">' + main + '</span>');
+    if (it.file) fileMeta[it.file.id] = it.file;
+    return '<div class="lib-item" data-name="' + esc(it.title + ' ' + (it.note || '')) + '">' + open +
+      (canEdit ? '<button class="iconbtn" data-action="editLibItem" data-id="' + esc(it.id) + '" aria-label="編集">' + icon('pen', 18) + '</button>' : '') + '</div>';
+  }
+
+  function viewLibrary() {
+    var L = state.lib;
+    if (!L) return '<div class="muted center">読み込み中…</div>';
+    var add = L.canEdit && L.shelves.length ? '<button class="btn primary block" data-action="newLibItem">' + icon('plus', 16) + '資料を追加</button>' : '';
+    if (!L.shelves.length) {
+      return '<div class="empty">まだ資料がありません</div>' +
+        (L.canEdit ? '<div class="muted small">まず「棚」を作ってください（例：規程・マニュアル、名簿、申請フォーム）。</div><button class="btn primary block" data-go="libShelves">棚を作る</button>' : '');
+    }
+    var shelves = L.shelves.map(function (sh) {
+      var items = L.items.filter(function (it) { return it.shelfId === sh.id; });
+      return '<section class="lib-shelf stack" style="gap:8px"><div class="section-title">' + icon('folder', 16) + ' ' + esc(sh.name) +
+        (sh.groupId ? ' <span class="tag soon">' + esc(sh.groupName || 'グループ') + 'のみ</span>' : '') + '</div>' +
+        (items.length ? '<div class="card lib-list">' + items.map(function (it) { return libItemRow(it, L.canEdit); }).join('') + '</div>'
+          : '<div class="muted small">この棚はまだ空です</div>') + '</section>';
+    }).join('');
+    return '<input type="text" class="user-filter" data-filter="lib" placeholder="資料の名前で探す" aria-label="資料の名前で探す">' + add + shelves;
+  }
+
+  function viewLibShelves() {
+    var L = state.lib;
+    if (!L) return '<div class="muted center">読み込み中…</div>';
+    if (!L.canEdit) return '<div class="empty">資料箱を整理できるのは、全体管理者と資料箱管理者だけです</div>';
+    var rows = L.shelves.map(function (sh, i) {
+      var n = L.items.filter(function (it) { return it.shelfId === sh.id; }).length;
+      return '<div class="shelf-row"><div class="shelf-name"><b>' + esc(sh.name) + '</b><span class="muted small">' + n + '件' + (sh.groupId ? '・' + esc(sh.groupName || 'グループ') + 'のみ' : '・全員') + '</span></div>' +
+        '<button class="iconbtn" data-action="moveShelf" data-id="' + esc(sh.id) + '" data-d="-1" aria-label="上へ"' + (i === 0 ? ' disabled' : '') + '>▲</button>' +
+        '<button class="iconbtn" data-action="moveShelf" data-id="' + esc(sh.id) + '" data-d="1" aria-label="下へ"' + (i === L.shelves.length - 1 ? ' disabled' : '') + '>▼</button>' +
+        '<button class="btn small outline" data-action="editShelf" data-id="' + esc(sh.id) + '">編集</button>' +
+        '<button class="btn small danger" data-action="deleteShelf" data-id="' + esc(sh.id) + '">削除</button></div>';
+    }).join('');
+    return '<button class="btn primary block" data-action="newShelf">' + icon('plus', 16) + '棚を作る</button>' +
+      (rows ? '<div class="card">' + rows + '</div>' : '<div class="muted small">棚はまだありません</div>') +
+      '<div class="muted small">棚は、資料の分類です。グループを選ぶと、そのグループのメンバーだけに見える棚になります。</div>';
+  }
+
+  function keepLibForm() {
+    var f = document.querySelector('[data-form="libItem"]');
+    var d = state.libForm;
+    if (!f || !d) return;
+    d.shelfId = f.shelfId.value; d.title = f.title.value; d.note = f.note.value; d.pinned = f.pinned.checked;
+    if (f.url) d.url = f.url.value;
+  }
+
+  function viewLibItemForm() {
+    var d = state.libForm, L = state.lib;
+    if (!d || !L) return '';
+    var shelfOpts = L.shelves.map(function (sh) {
+      return '<option value="' + esc(sh.id) + '"' + (sh.id === d.shelfId ? ' selected' : '') + '>' + esc(sh.name) + (sh.groupId ? '（' + esc(sh.groupName || 'グループ') + 'のみ）' : '') + '</option>';
+    }).join('');
+    var radio = function (v, label) {
+      return '<label class="check"><input type="radio" name="kind" value="' + v + '" data-change="libKind"' + (d.kind === v ? ' checked' : '') + '>' + label + '</label>';
+    };
+    var body = d.kind === 'link'
+      ? '<div class="field"><label for="li-url">リンク（URL）</label><input id="li-url" name="url" type="url" value="' + esc(d.url || '') + '" placeholder="https://" required>' +
+        '<div class="hint muted small">Googleドライブのファイル・フォルダ、スプレッドシート、フォーム、マイマップ、Webページなど。Googleのファイルは、見る人にも共有されている必要があります</div></div>'
+      : '<div class="field"><label>ファイル（画像・PDF）</label>' + attachPicker('lib', d.files) + '</div>';
+    return '<form class="card stack" data-form="libItem">' +
+      '<div class="field"><label for="li-shelf">棚</label><select id="li-shelf" name="shelfId">' + shelfOpts + '</select></div>' +
+      '<div class="field"><label for="li-title">資料の名前</label><input id="li-title" name="title" type="text" maxlength="60" value="' + esc(d.title || '') + '" placeholder="例：就業規則、緊急連絡網、備品申請フォーム" required></div>' +
+      '<div class="field"><label>種類</label><div class="row-inline">' + radio('link', 'リンク') + radio('file', 'ファイル') + '</div></div>' +
+      body +
+      '<div class="field"><label for="li-note">説明（任意）</label><input id="li-note" name="note" type="text" maxlength="200" value="' + esc(d.note || '') + '" placeholder="例：2026年4月改定版"></div>' +
+      '<label class="check"><input type="checkbox" name="pinned"' + (d.pinned ? ' checked' : '') + '>よく使う資料として上に固定する</label>' +
+      '<button class="btn primary block" type="submit">保存する</button></form>' +
+      (d.item ? '<button class="linkbtn danger-text" data-action="deleteLibItem">この資料を削除する</button>' : '');
   }
 
   // ---------- グループ ----------
@@ -1196,17 +1310,21 @@
   // 入力欄のない画面だけ、自動更新で書き換える
   var SAFE_TO_RENDER = ['home', 'board', 'inbox', 'menu', 'groups', 'calendar', 'territory'];
 
-  // ---------- 区域カード ----------
-  function terrTitle(c) { return (c.type === 'list' ? 'リスト ' : '区域 ') + c.number + (c.name ? ' ' + c.name : ''); }
+  // ---------- 共有カード ----------
+  function terrTitle(c) { return 'No.' + c.number + (c.name ? ' ' + c.name : ''); }
   function isList(c) { return c.type === 'list'; }
-  function notList(c) { return c.type !== 'list'; }
+  // 借りる・返すを使うカード／使わないカード（みんなで見るだけ）
+  function isLend(c) { return c.lendable !== false && c.type !== 'list'; }
+  function isShared(c) { return !isLend(c); }
+  var CARD_TYPES = { map: '図面・画像', list: '表', link: 'リンク' };
 
   // リストの1行（借りる・返却はなく、全員がいつでも開ける）
   function listRow(c) {
     return '<div class="terr-row" data-name="' + esc(c.number + ' ' + (c.name || '')) + '">' +
       '<button class="terr-open" data-action="openTerr" data-id="' + esc(c.id) + '">' +
         '<span class="terr-no list">' + esc(c.number) + '</span>' +
-        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : 'リスト ' + esc(c.number)) +
+        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : 'No.' + esc(c.number)) +
+          ' <span class="tag soon">' + (CARD_TYPES[c.type] || '') + '</span>' +
           (c.warnCount ? ' <span class="tag imp">要注意 ' + c.warnCount + '</span>' : '') + '</span>' +
           (c.commentCount ? '<span class="muted small">コメント ' + c.commentCount + '件</span>' : '') +
         '</span><span class="chev">' + icon('next', 18) + '</span></button>' +
@@ -1238,7 +1356,7 @@
     return '<div class="terr-row" data-name="' + esc(c.number + ' ' + (c.name || '')) + '">' +
       '<button class="terr-open" data-action="openTerr" data-id="' + esc(c.id) + '">' +
         '<span class="terr-no' + (c.needReturn ? ' warn' : '') + '">' + c.number + '</span>' +
-        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : '区域 ' + c.number) +
+        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : 'No.' + c.number) +
           (c.type === 'list' ? ' <span class="tag soon">リスト</span>' : '') +
           (c.warnCount ? ' <span class="tag imp">要注意 ' + c.warnCount + '</span>' : '') + '</span>' +
         '<span class="small">' + terrStatus(c) + '</span>' +
@@ -1249,7 +1367,7 @@
     '</div>';
   }
 
-  // 区域番号の扱い（「1-2」→親番号「1」）
+  // 番号の扱い（「1-2」→親番号「1」）
   function terrParent(label) { return String(label).split('-')[0]; }
   function terrKey(label) { var p = String(label).split('-'); return [Number(p[0]) || 0, Number(p[1]) || 0]; }
   function normTerrLabel(v) {
@@ -1283,7 +1401,7 @@
       return '<div class="terr-group" data-parent="' + esc(p) + '">' +
         '<button class="terr-parent" data-action="toggleParent" data-key="' + esc(openKey) + '" aria-expanded="' + open + '">' +
           '<span class="terr-no' + (need ? ' warn' : '') + '">' + esc(p) + '</span>' +
-          '<span class="terr-main"><span class="terr-name">区域 ' + esc(p) + (warn ? ' <span class="tag imp">要注意 ' + warn + '</span>' : '') + '</span>' +
+          '<span class="terr-main"><span class="terr-name">No.' + esc(p) + (warn ? ' <span class="tag imp">要注意 ' + warn + '</span>' : '') + '</span>' +
           '<span class="muted small">' + sub + '</span></span>' +
           '<span class="chev">' + icon('next', 18) + '</span></button>' +
         '<div class="terr-children"' + (open ? '' : ' hidden') + '>' + list.map(terrRow).join('') + '</div></div>';
@@ -1293,20 +1411,21 @@
   function viewTerritory() {
     var t = state.terr;
     if (!t) return '<div class="muted center">読み込み中…</div>';
-    var lists = t.cards.filter(isList);
-    var cards = t.cards.filter(notList);
+    var lists = t.cards.filter(isShared);
+    var cards = t.cards.filter(isLend);
     var seg = '';
+    var sharedView = function () {
+      return '<input type="text" id="terr-search" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
+        '<div class="muted small">借りずに、全員がいつでも開けるカードです。</div>' +
+        (lists.length ? '<div class="card terr-list">' + lists.map(listRow).join('') + '</div>' : '<div class="empty">まだカードがありません</div>');
+    };
+    if (!cards.length) return sharedView();
     if (lists.length) {
       seg = '<div class="seg">' +
-        '<button data-action="terrSeg" data-tab="cards" class="' + (state.terrSeg !== 'lists' ? 'on' : '') + '">区域カード</button>' +
-        '<button data-action="terrSeg" data-tab="lists" class="' + (state.terrSeg === 'lists' ? 'on' : '') + '">リスト（' + lists.length + '）</button>' +
+        '<button data-action="terrSeg" data-tab="cards" class="' + (state.terrSeg !== 'lists' ? 'on' : '') + '">貸し出し</button>' +
+        '<button data-action="terrSeg" data-tab="lists" class="' + (state.terrSeg === 'lists' ? 'on' : '') + '">共有（' + lists.length + '）</button>' +
       '</div>';
-      if (state.terrSeg === 'lists') {
-        return seg +
-          '<input type="text" id="terr-search" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
-          '<div class="muted small">リストは借りずに、全員がいつでも開いて編集できます。</div>' +
-          '<div class="card terr-list">' + lists.map(listRow).join('') + '</div>';
-      }
+      if (state.terrSeg === 'lists') return seg + sharedView();
     }
     var mine = cards.filter(function (c) { return c.heldByMe; });
     var avail = cards.filter(function (c) { return c.available && !c.heldByMe; });
@@ -1314,10 +1433,10 @@
     var banner = seg + '<div class="terr-banner"><div><div class="small">今の貸出対象</div><div class="big">' + cards.filter(function (c) { return c.available; }).length + '枚</div></div>' +
       '<div class="right"><div class="small">返却期限</div><div class="big">借りてから' + t.dueDays + '日</div></div></div>';
     var html = banner;
-    if (mine.length) html += '<section class="stack" style="gap:8px"><div class="section-title">借りている区域（' + mine.length + '）</div><div class="card terr-list">' + mine.map(terrRow).join('') + '</div></section>';
+    if (mine.length) html += '<section class="stack" style="gap:8px"><div class="section-title">借りているカード（' + mine.length + '）</div><div class="card terr-list">' + mine.map(terrRow).join('') + '</div></section>';
     html += '<input type="text" id="terr-search" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み（例：3-2）" aria-label="番号・名前で絞り込み">';
-    html += '<section class="stack" style="gap:8px"><div class="section-title">貸出対象の区域（' + avail.length + '）</div>' +
-      (avail.length ? '<div class="card terr-list">' + terrGroups(avail, 'av') + '</div>' : '<div class="empty">今は貸出対象の区域がありません</div>') + '</section>';
+    html += '<section class="stack" style="gap:8px"><div class="section-title">貸出対象のカード（' + avail.length + '）</div>' +
+      (avail.length ? '<div class="card terr-list">' + terrGroups(avail, 'av') + '</div>' : '<div class="empty">今は貸出対象のカードがありません</div>') + '</section>';
     if (others.length) html += '<section class="stack" style="gap:8px"><div class="section-title">貸出対象外（管理者のみ表示・' + others.length + '）</div><div class="card terr-list">' + terrGroups(others, 'ot') + '</div></section>';
     return html;
   }
@@ -1334,7 +1453,8 @@
     var known = state.terr && state.terr.cards.filter(function (c) { return c.id === id; })[0];
     state.terrCard = known ? JSON.parse(JSON.stringify(known)) : null;
     if (state.terrCard) state.terrCard.loading = true;
-    state.terrTab = known && known.type === 'list' ? 'list' : 'map';
+    state.terrTab = known ? ({ list: 'list', link: 'link', map: 'map' })[known.type] || 'map' : 'map';
+    if (known && known.type === 'link' && !isLend(known)) state.terrTab = 'comments';
     state.terrBack = back || (state.screen === 'terrAdmin' ? 'terrAdmin' : state.screen === 'home' ? 'home' : 'territory');
     mapView.cardId = null;   // 別のカードを開いたら倍率・位置・全画面を初期状態に
     state.screen = 'terrCard';
@@ -1357,16 +1477,16 @@
   function viewTerrCard() {
     var c = state.terrCard;
     if (!c) return '<div class="muted center">読み込み中…</div>';
-    if (isList(c)) return viewListCard(c);
+    if (isShared(c)) return viewListCard(c);
     var info = '<div class="card terr-info">' +
       '<div class="ti-row"><span class="muted">状態</span><span>' + terrStatus(c) + '</span></div>' +
       (c.held && c.borrowedAt ? '<div class="ti-row"><span class="muted">借りた日</span><span>' + fmtDay(c.borrowedAt) + '</span></div>' : '') +
       '<div class="ti-row"><span class="muted">前回の使用</span><span>' + (c.lastUserName ? esc(c.lastUserName) + (c.lastUsedDate ? '・' + fmtYmdJa(c.lastUsedDate) + 'に使用' : '') : 'まだ記録がありません') + '</span></div>' +
     '</div>';
-    if (c.needReturn && c.heldByMe) info = '<div class="notice">' + icon('warn', 16) + ' この区域は貸出対象外になりました。返却をお願いします。</div>' + info;
+    if (c.needReturn && c.heldByMe) info = '<div class="notice">' + icon('warn', 16) + ' このカードは貸出対象外になりました。返却をお願いします。</div>' + info;
 
     var actions = '';
-    if (c.canBorrow) actions += '<button class="btn primary block" data-action="borrowTerr" data-id="' + esc(c.id) + '">この区域を借りる</button>';
+    if (c.canBorrow) actions += '<button class="btn primary block" data-action="borrowTerr" data-id="' + esc(c.id) + '">このカードを借りる</button>';
     if (c.canReturn) actions += '<button class="btn primary block" data-action="returnTerr">' + (c.heldByMe ? '返却する' : '代理で返却する') + '</button>';
     if (c.isAdmin) {
       actions += '<div class="actions">' +
@@ -1376,7 +1496,7 @@
       '</div>';
     }
 
-    var tabs = [[c.type === 'list' ? 'list' : 'map', c.type === 'list' ? 'リスト' : '地図'], ['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]];
+    var tabs = [[c.type === 'link' ? 'link' : 'map', c.type === 'link' ? 'リンク' : '図面・画像'], ['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]];
     var tabHtml = '<div class="tabs">' + tabs.map(function (t) {
       return '<button class="' + (state.terrTab === t[0] ? 'on' : '') + '" data-action="terrTab" data-tab="' + t[0] + '">' + t[1] + '</button>';
     }).join('') + '</div>';
@@ -1387,26 +1507,41 @@
     var body;
     if (state.terrTab === 'comments') body = viewTerrComments(c);
     else if (state.terrTab === 'list') body = viewTerrList(c);
+    else if (state.terrTab === 'link') body = '<div class="card stack">' + linkBox(c) + '</div>';
     else body = viewTerrMap(c);
     return info + actions + warnBox + tabHtml + body;
   }
 
-  // リスト：表の表示・編集とコメント（借りる・返却はなし）
+  // 借りる・返すを使わないカード：表・図面・リンクとコメント
+  function linkBox(c) {
+    if (!c.linkUrl) return '<div class="muted small">読み込み中…</div>';
+    var host = '';
+    try { host = new URL(c.linkUrl).hostname; } catch (e) { host = ''; }
+    return '<a class="btn primary block" href="' + esc(c.linkUrl) + '" target="_blank" rel="noopener">' + icon('open', 16) + '開く</a>' +
+      '<div class="muted small" style="overflow-wrap:anywhere">' + esc(host) + '</div>';
+  }
   function viewListCard(c) {
-    var top = '<div class="card stack">' +
-      (c.sheetUrl
+    var top = '';
+    if (c.type === 'list') {
+      top = c.sheetUrl
         ? '<a class="btn outline block" href="' + esc(c.sheetUrl) + '" target="_blank" rel="noopener">' + icon('open', 16) + 'スプレッドシートで開く</a>' +
           '<div class="muted small">スプレッドシートを共有されている人だけが開けます。共有されていない人は、下の表で表示・編集できます。</div>'
-        : '<div class="muted small">読み込み中…</div>') +
-      (c.isAdmin ? '<div class="actions"><button class="btn small outline" data-action="editTerr">編集</button></div>' : '') +
-    '</div>';
-    var tabs = [['list', '表'], ['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]];
+        : '<div class="muted small">読み込み中…</div>';
+    } else if (c.type === 'link') {
+      top = linkBox(c);
+    }
+    var adminBtn = c.isAdmin ? '<div class="actions"><button class="btn small outline" data-action="editTerr">編集</button></div>' : '';
+    top = top || adminBtn ? '<div class="card stack">' + top + adminBtn + '</div>' : '';
+    var main = c.type === 'list' ? ['list', '表'] : c.type === 'map' ? ['map', '図面・画像'] : null;
+    if (!main && state.terrTab !== 'comments') state.terrTab = 'comments';
+    var tabs = (main ? [main] : []).concat([['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]]);
     var tabHtml = '<div class="tabs">' + tabs.map(function (t) {
       return '<button class="' + (state.terrTab === t[0] ? 'on' : '') + '" data-action="terrTab" data-tab="' + t[0] + '">' + t[1] + '</button>';
     }).join('') + '</div>';
     var warn = (c.comments || []).filter(function (x) { return x.warn; });
     var warnBox = warn.length ? '<div class="warn-box">' + icon('warn', 16) + '<div>' + warn.map(function (x) { return '<div>' + esc(x.body) + '</div>'; }).join('') + '</div></div>' : '';
-    return top + warnBox + tabHtml + (state.terrTab === 'comments' ? viewTerrComments(c) : viewTerrList(c));
+    var body = state.terrTab === 'comments' ? viewTerrComments(c) : c.type === 'map' ? viewTerrMap(c) : viewTerrList(c);
+    return top + warnBox + tabHtml + body;
   }
 
   // ----- 地図と書き込み -----
@@ -1420,7 +1555,7 @@
   var mapView = { cardId: null, zoom: 1, sl: 0, st: 0, full: false };
 
   function viewTerrMap(c) {
-    if (!c.fileId) return c.loading ? '<div class="muted center small">読み込み中…</div>' : '<div class="empty">地図が登録されていません</div>';
+    if (!c.fileId) return c.loading ? '<div class="muted center small">読み込み中…</div>' : '<div class="empty">画像が登録されていません</div>';
     var tool = function (key, ic, label, extra) {
       return '<button type="button" class="tool' + (ink.tool === key ? ' on' : '') + '" data-action="inkTool" data-tool="' + key + '" aria-label="' + label + '" title="' + label + '">' + (extra || icon(ic, 20)) + '</button>';
     };
@@ -1445,12 +1580,12 @@
       '<span class="ink-status muted small" id="ink-status">' + esc(ink.status) + '</span></div>';
     var note = c.canInk
       ? '<div class="muted small">2本指で拡大・縮小・移動できます。ペンなどを選んでいるときは、1本指で書き込みます。書き込みは自動で保存され、次に借りる人に引き継がれます。消しゴムで触れた線や印が消えます' +
-        (c.isAdmin ? '（区域カード管理者はすべて消せます）。' : '（消せるのは自分が書いたものだけです）。') + '</div>'
-      : '<div class="muted small">2本指で拡大・縮小・移動できます。書き込めるのは、借りている人と区域カード管理者だけです。</div>';
-    var clear = c.isAdmin ? '<button class="linkbtn danger-text" data-action="inkClear">書き込みを全消去（区域カード管理者）</button>' : '';
+        (c.isAdmin ? '（共有カード管理者はすべて消せます）。' : '（消せるのは自分が書いたものだけです）。') + '</div>'
+      : '<div class="muted small">2本指で拡大・縮小・移動できます。書き込めるのは、' + (isLend(c) ? '借りている人と' : '') + '共有カード管理者だけです。</div>';
+    var clear = c.isAdmin ? '<button class="linkbtn danger-text" data-action="inkClear">書き込みを全消去（共有カード管理者）</button>' : '';
     return '<div class="map-area' + (mapView.full ? ' full' : '') + '" id="map-area">' + tools + zoom +
       '<div class="map-wrap" id="map-wrap"><div class="map-inner" id="map-inner">' +
-        '<img id="map-img" alt="区域' + c.number + 'の地図" draggable="false">' +
+        '<img id="map-img" alt="カード' + c.number + 'の画像" draggable="false">' +
         '<canvas id="map-ink"></canvas>' +
       '</div></div></div>' + note + clear;
   }
@@ -1483,7 +1618,7 @@
         applyMapZoom(mapView.zoom);
         restoreMapScroll();
       }
-    }, function () { img.alt = '地図を読み込めませんでした'; });
+    }, function () { img.alt = '画像を読み込めませんでした'; });
     var wrap = document.getElementById('map-wrap');
     if (wrap && !wrap.dataset.bound) {
       wrap.dataset.bound = '1';
@@ -1913,12 +2048,12 @@
     var form = c.canComment
       ? '<form class="stack" data-form="terrComment" style="padding-top:12px">' +
           '<label for="tc-body" class="sr-only">コメント</label>' +
-          '<textarea id="tc-body" name="body" maxlength="500" placeholder="例：3番の家は留守が多い／〇〇の家は訪問を控える" required></textarea>' +
+          '<textarea id="tc-body" name="body" maxlength="500" placeholder="例：バッテリーが弱い／2階の分電盤は鍵が必要" required></textarea>' +
           '<label class="check"><input type="checkbox" name="warn">要注意の情報として目立たせる</label>' +
           '<button class="btn primary block" type="submit">コメントを残す</button>' +
           (!c.heldByMe && !c.isAdmin ? '<div class="muted small">返却後3日間はコメントを追加できます</div>' : '') +
         '</form>'
-      : '<div class="muted small" style="padding-top:8px">コメントを書けるのは、借りている人と区域カード管理者だけです</div>';
+      : '<div class="muted small" style="padding-top:8px">コメントを書けるのは、借りている人と共有カード管理者だけです</div>';
     return '<section class="card">' + (list || '<div class="muted small" style="padding:8px 0">まだコメントはありません</div>') + form + '</section>';
   }
 
@@ -1938,7 +2073,9 @@
         '<div class="dialog-msg">' + esc(title) + '</div>' +
         fields.map(function (f, i) {
           var id = 'dlg-f' + i;
-          var input = f.type === 'textarea'
+          var input = f.type === 'select'
+            ? '<select id="' + id + '" name="f' + i + '">' + f.options.map(function (o) { return '<option value="' + esc(o[0]) + '"' + (o[0] === (f.value || '') ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; }).join('') + '</select>'
+            : f.type === 'textarea'
             ? '<textarea id="' + id + '" name="f' + i + '" maxlength="1000">' + esc(f.value || '') + '</textarea>'
             : '<input id="' + id + '" name="f' + i + '" type="' + (f.type || 'text') + '" value="' + esc(f.value || '') + '"' + (f.max ? ' max="' + f.max + '"' : '') + '>';
           return '<div class="field"><label for="' + id + '">' + esc(f.label) + '</label>' + input + (f.hint ? '<div class="hint muted small">' + esc(f.hint) + '</div>' : '') + '</div>';
@@ -1948,6 +2085,20 @@
       d.hidden = false;
       var first = d.querySelector('input,textarea');
       if (first) setTimeout(function () { first.focus(); }, 50);
+    });
+  }
+  function shelfDialog(sh) {
+    var L = state.lib;
+    var opts = [['', '全員']].concat((L.groups || []).map(function (g) { return [g.id, g.name + 'のメンバーだけ']; }));
+    return formDialog(sh ? '棚を編集' : '棚を作る', [
+      { label: '棚の名前', value: sh ? sh.name : '' },
+      { label: '見られる人', type: 'select', options: opts, value: sh ? sh.groupId : '' }
+    ], '保存する').then(function (v) {
+      if (!v) return;
+      return run('api_saveShelf', state.token, sh ? sh.id : '', v[0], v[1]).then(function () {
+        toast('保存しました。');
+        return loadLibrary();
+      });
     });
   }
   function closeFormDialog(values) {
@@ -1968,7 +2119,7 @@
     }).join('') : '<div class="muted small">読み込み中…</div>';
     return '<div class="muted">' + esc(terrTitle(c)) + 'を貸し出す相手を選んでください。</div>' +
       '<form class="card stack" data-form="lendName"><div class="field"><label for="lend-name">アプリを使っていない人に貸す場合は名前を入力</label>' +
-      '<input id="lend-name" name="name" type="text" maxlength="30" placeholder="例：山田（紙のカード）"></div>' +
+      '<input id="lend-name" name="name" type="text" maxlength="30" placeholder="例：山田（アプリを使っていない人）"></div>' +
       '<button class="btn outline block" type="submit">この名前で貸し出す</button></form>' +
       '<input type="text" class="user-filter" data-filter="users" placeholder="メンバーを名前で絞り込み" aria-label="メンバーを名前で絞り込み">' +
       '<div class="card user-list">' + users + '</div>';
@@ -1990,27 +2141,33 @@
   function viewTerrEdit() {
     var e = state.terrEdit;
     if (!e) return '';
-    var c = e.card || { number: '', name: '', type: 'list', sheetUrl: '' };
-    var url = c.type === 'list'
+    var c = e.card || { number: '', name: '', type: e.type || 'list', sheetUrl: '', linkUrl: '', lendable: false };
+    var lendBox = c.type !== 'list'
+      ? '<label class="check"><input type="checkbox" name="lendable"' + (isLend(c) ? ' checked' : '') + '>借りる・返すを使う（誰が持っているか・返却期限を管理）</label>'
+      : '';
+    var url = c.type === 'link'
+      ? '<div class="field"><label for="te-link">リンク（URL）</label><input id="te-link" name="link" type="url" value="' + esc(c.linkUrl || '') + '" placeholder="https://" required>' +
+        '<div class="hint muted small">Googleドライブのファイル・フォルダ、フォーム、マイマップ、Webページなど。Googleのファイルは、開く人にも共有されている必要があります</div></div>'
+      : c.type === 'list'
       ? '<div class="field"><label for="te-url">GoogleスプレッドシートのURL</label><input id="te-url" name="url" type="text" value="' + esc(c.sheetUrl || '') + '"' + (e.card ? '' : ' required') + '>' +
         '<div class="hint muted small">あなたのGoogleアカウントで開ける表を指定してください。シート（タブ）を開いた状態のURLなら、そのシートを読み込みます。1行目は見出しとして扱います</div></div>'
-      : '<div class="field"><label>地図</label><label class="btn small outline att-add">地図を差し替える<input type="file" accept="image/*,application/pdf" data-upload="terrReplace" class="sr-only"></label></div>';
+      : '<div class="field"><label>画像</label><label class="btn small outline att-add">画像を差し替える<input type="file" accept="image/*,application/pdf" data-upload="terrReplace" class="sr-only"></label></div>';
     return '<form class="card stack" data-form="terrEdit">' +
-      '<div class="field"><label for="te-no">' + (isList(c) ? '番号' : '区域番号') + '</label><input id="te-no" name="number" type="text" inputmode="numeric" maxlength="9" value="' + esc(c.number) + '" placeholder="例：1-1 または 12" required><div class="hint muted small">枝番は「1-1」のようにハイフンで区切ります</div></div>' +
-      '<div class="field"><label for="te-name">名前（任意）</label><input id="te-name" name="name" type="text" maxlength="40" value="' + esc(c.name || '') + '" placeholder="例：駅前"></div>' +
-      url +
+      '<div class="field"><label for="te-no">番号</label><input id="te-no" name="number" type="text" inputmode="numeric" maxlength="9" value="' + esc(c.number) + '" placeholder="例：1-1 または 12" required><div class="hint muted small">枝番は「1-1」のようにハイフンで区切ります</div></div>' +
+      '<div class="field"><label for="te-name">名前（任意）</label><input id="te-name" name="name" type="text" maxlength="40" value="' + esc(c.name || '') + '" placeholder="例：脚立A、1階配線図"></div>' +
+      url + lendBox +
       '<button class="btn primary block" type="submit">保存する</button></form>' +
-      (e.card ? '<button class="linkbtn danger-text" data-action="deleteTerr">' + (isList(c) ? 'このリストを削除する（スプレッドシートは消えません）' : 'この区域カードを削除する') + '</button>' : '');
+      (e.card ? '<button class="linkbtn danger-text" data-action="deleteTerr">' + (isList(c) ? 'このカードを削除する（スプレッドシートは消えません）' : 'このカードを削除する') + '</button>' : '');
   }
 
-  // ----- 区域カードの管理 -----
+  // ----- 共有カードの管理 -----
   function viewTerrAdmin() {
     var t = state.terr;
     if (!t) return '<div class="muted center">読み込み中…</div>';
-    if (!t.isAdmin) return '<div class="empty">区域カード管理者だけが使える画面です</div>';
+    if (!t.isAdmin) return '<div class="empty">共有カード管理者だけが使える画面です</div>';
     var a = state.terrAdmin = state.terrAdmin || { selected: null, bulk: [] };
-    var cards = t.cards.filter(notList);
-    var lists = t.cards.filter(isList);
+    var cards = t.cards.filter(isLend);
+    var lists = t.cards.filter(isShared);
     if (!a.selected) {
       a.selected = {};
       cards.forEach(function (c) { if (c.available) a.selected[c.id] = true; });
@@ -2030,7 +2187,7 @@
       var openKey = 'adm:' + p;
       var open = !!terrOpen[openKey];
       return '<div class="avail-row">' +
-        '<button type="button" class="avail-parent' + stateCls + '" data-action="toggleAvailParent" data-parent="' + esc(p) + '" aria-label="区域' + esc(p) + 'をまとめて選択・解除">' +
+        '<button type="button" class="avail-parent' + stateCls + '" data-action="toggleAvailParent" data-parent="' + esc(p) + '" aria-label="カード' + esc(p) + 'をまとめて選択・解除">' +
           '<b>' + esc(p) + '</b><span>' + n + '/' + list.length + '</span></button>' +
         (list.length > 1 || String(list[0].number).indexOf('-') >= 0
           ? '<button type="button" class="avail-open" data-action="toggleParent" data-key="' + esc(openKey) + '" aria-expanded="' + open + '" aria-label="枝番を表示">' + icon('next', 16) + '</button>' +
@@ -2053,26 +2210,29 @@
         '<form class="row-inline" data-form="availRange"><input name="from" type="text" inputmode="numeric" class="num-input" aria-label="開始番号" placeholder="1"><span>〜</span>' +
         '<input name="to" type="text" inputmode="numeric" class="num-input" aria-label="終了番号" placeholder="3"><button class="btn small outline" type="submit">範囲で選択</button>' +
         '<button class="btn small outline" type="button" data-action="availNone">すべて解除</button></form>' +
-        (cards.length ? '<div class="avail-list">' + chips + '</div>' : '<div class="muted small">区域カードがまだ登録されていません</div>') +
+        (cards.length ? '<div class="avail-list">' + chips + '</div>' : '<div class="muted small">共有カードがまだ登録されていません</div>') +
         '<div class="muted small">「1〜3」と入れると1-1〜3-6をまとめて選びます。「2-3〜2-5」のように枝番でも指定できます。親番号をタップするとその枝番をまとめて選択・解除、右の矢印で枝番を1枚ずつ選べます。下線の番号は貸出中です</div>' +
         '<button class="btn primary block" data-action="saveAvail">貸出対象を保存</button>' +
       '</section>' +
       '<section class="card stack">' +
-        '<div class="section-title">地図型の区域をまとめて登録</div>' +
-        '<div class="muted small">地図の画像（JPG・PNG）やPDFを複数選べます。ファイル名の番号を区域番号にします（例：1-1.jpg → 区域1-1、12.jpg → 区域12）。PDFは1ページ目を画像にして登録します。たくさんある場合は、100枚くらいずつに分けて登録してください</div>' +
-        '<label class="check"><input type="checkbox" id="bulk-replace">同じ番号がある場合は地図を差し替える</label>' +
+        '<div class="section-title">図面・画像のカードをまとめて登録</div>' +
+        '<div class="muted small">画像（JPG・PNG）やPDF（図面・地図・写真・説明書など）を複数選べます。ファイル名の数字をカードの番号にします（例：1-1.jpg → No.1-1、12.jpg → No.12）。PDFは1ページ目を画像にして登録します。たくさんある場合は、100枚くらいずつに分けて登録してください</div>' +
+        '<label class="check"><input type="checkbox" id="bulk-lend" checked>借りる・返すを使う（備品・担当エリアなど）</label>' +
+        '<label class="check"><input type="checkbox" id="bulk-replace">同じ番号がある場合は画像を差し替える</label>' +
         '<label class="btn primary att-add">' + icon('plus', 16) + 'ファイルを選んで登録<input type="file" multiple accept="image/*,application/pdf" data-upload="terrBulk" class="sr-only"></label>' +
         (bulk ? '<div class="bulk-list">' + bulk + '</div>' : '') +
       '</section>' +
-      '<section class="stack" style="gap:8px"><div class="section-title">登録済みの区域カード（' + cards.length + '）</div>' +
-        '<input type="text" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
-        '<div class="card terr-list">' + terrGroups(cards, 'all') + '</div></section>' +
       '<section class="card stack">' +
-        '<div class="section-title">リスト（' + lists.length + '）</div>' +
-        '<div class="muted small">Googleスプレッドシートの表を登録すると、メンバー全員がアプリの中で表示・編集できます（借りる・返却はありません）。スプレッドシートは非公開のままで大丈夫です</div>' +
-        (lists.length ? '<div class="terr-list">' + lists.map(listRow).join('') + '</div>' : '') +
-        '<button class="btn outline block" data-action="newListTerr">' + icon('plus', 16) + 'リストを登録</button>' +
-      '</section>';
+        '<div class="section-title">表・リンクのカードを登録</div>' +
+        '<div class="muted small"><b>表</b>：Googleスプレッドシートを、メンバー全員がアプリの中で表示・編集できます（スプレッドシートは非公開のままで大丈夫です）。<br><b>リンク</b>：Googleドライブ・フォーム・マイマップ・Webページなどを、カードとして開けるようにします</div>' +
+        '<div class="actions"><button class="btn outline" data-action="newListTerr">' + icon('plus', 16) + '表を登録</button>' +
+        '<button class="btn outline" data-action="newLinkTerr">' + icon('plus', 16) + 'リンクを登録</button></div>' +
+      '</section>' +
+      '<input type="text" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
+      '<section class="stack" style="gap:8px"><div class="section-title">貸し出しするカード（' + cards.length + '）</div>' +
+        (cards.length ? '<div class="card terr-list">' + terrGroups(cards, 'all') + '</div>' : '<div class="muted small">まだありません</div>') + '</section>' +
+      '<section class="stack" style="gap:8px"><div class="section-title">共有のカード（借りずに全員が開ける・' + lists.length + '）</div>' +
+        (lists.length ? '<div class="card terr-list">' + lists.map(listRow).join('') + '</div>' : '<div class="muted small">まだありません</div>') + '</section>';
   }
 
   // 地図ファイルを登録用の画像に変換（画像は縮小、PDFは1ページ目を画像に）
@@ -2115,7 +2275,7 @@
     });
   }
 
-  // ファイル名から区域番号を読み取る（例：「1-1.jpg」「区域3_2.pdf」「１２.png」）
+  // ファイル名から番号を読み取る（例：「1-1.jpg」「カード3_2.pdf」「１２.png」）
   function labelFromFileName(name) {
     var base = String(name).replace(/\.[^.]+$/, '')
       .replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
@@ -2129,6 +2289,8 @@
     input.value = '';
     if (!files.length) return;
     var replace = !!(document.getElementById('bulk-replace') || {}).checked;
+    var lendEl = document.getElementById('bulk-lend');
+    var lend = lendEl ? lendEl.checked : true;
     var a = state.terrAdmin;
     a.bulk = files.map(function (f) { return { file: f.name, state: 'wait', msg: '待機中' }; });
     render();
@@ -2139,14 +2301,14 @@
         var label = labelFromFileName(f.name);
         if (!label) { row.state = 'ng'; row.msg = 'ファイル名に番号がないため、登録しませんでした'; render(); return; }
         row.state = 'run';
-        row.msg = '区域' + label + 'として登録中…';
+        row.msg = 'No.' + label + 'として登録中…';
         render();
         return mapFileToJpeg(f).then(function (b64) {
-          return call('api_saveMapCard', state.token, label, '', 'image/jpeg', b64, replace);
+          return call('api_saveMapCard', state.token, label, '', 'image/jpeg', b64, replace, lend);
         }).then(function (r) {
           ok++;
           row.state = 'ok';
-          row.msg = '区域' + label + (r.replaced ? 'の地図を差し替えました' : 'を登録しました');
+          row.msg = 'No.' + label + (r.replaced ? 'の画像を差し替えました' : 'を登録しました');
         }, function (e) {
           row.state = 'ng';
           row.msg = errorText(e);
@@ -2172,7 +2334,7 @@
       return call('api_saveMapCard', state.token, c.number, '', 'image/jpeg', b64, true);
     }).then(function () {
       setBusy(false);
-      toast('地図を差し替えました。');
+      toast('画像を差し替えました。');
       fileCache = {};
       openTerr(c.id, 'territory');
     }, function (e) {
@@ -2254,6 +2416,7 @@
   function attFiles(target) {
     if (target === 'compose') return state.compose ? state.compose.files : [];
     if (target === 'chat') return state.chat ? state.chat.files : [];
+    if (target === 'lib') return state.libForm ? state.libForm.files : [];
     return state.commentFiles;
   }
 
@@ -2269,6 +2432,10 @@
     var chosen = Array.prototype.slice.call(input.files || []);
     input.value = '';
     if (!chosen.length) return;
+    if (target === 'lib' && list.length + chosen.length > 1) {
+      toast('資料箱には、1つの資料につきファイルを1つ登録できます。', true);
+      return;
+    }
     if (list.length + chosen.length > MAX_FILES) {
       toast('添付は' + MAX_FILES + 'ファイルまでです。', true);
       return;
@@ -2593,7 +2760,7 @@
       '</form>' +
       '<div class="card stack">' +
         '<div class="section-title">まとめメール</div>' +
-        '<div class="small muted">未読のメッセージ・掲示板や、区域カードの返却期限を、1日2回（7時・18時ごろ）メールでお知らせします。新しい未読がないときは送りません。</div>' +
+        '<div class="small muted">未読のメッセージ・掲示板や、共有カードの返却期限を、1日2回（7時・18時ごろ）メールでお知らせします。新しい未読がないときは送りません。</div>' +
         (u.email
           ? '<label class="check"><input type="checkbox" data-change="digest"' + (u.digest !== false ? ' checked' : '') + '>まとめメールを受け取る</label>' +
             '<button class="btn outline block" data-action="digestTest">自分にテスト送信</button>'
@@ -2664,8 +2831,9 @@
     var self = state.user && m.id === state.user.id;
     var badges = '';
     if (m.role === 'admin') badges += '<span class="tag admin">全体管理者</span>';
-    if (m.territoryAdmin) badges += '<span class="tag terr">区域カード管理者</span>';
+    if (m.territoryAdmin) badges += '<span class="tag terr">共有カード管理者</span>';
     if (m.calendarEditor && m.role !== 'admin') badges += '<span class="tag cal">カレンダー編集者</span>';
+    if (m.libraryAdmin && m.role !== 'admin') badges += '<span class="tag cal">資料箱管理者</span>';
     if (!m.active) badges += '<span class="tag off">利用停止中</span>';
     return '<div class="card member">' +
       '<div class="member-head"><div class="avatar">' + esc((m.name || '?').slice(0, 1)) + '</div>' +
@@ -2677,7 +2845,8 @@
             '<option value="member"' + (m.role !== 'admin' ? ' selected' : '') + '>一般メンバー</option>' +
             '<option value="admin"' + (m.role === 'admin' ? ' selected' : '') + '>全体管理者</option>' +
           '</select></div>' +
-        '<label class="check"><input type="checkbox" data-change="territory" data-id="' + esc(m.id) + '"' + (m.territoryAdmin ? ' checked' : '') + '>区域カード管理者に任命</label>' +
+        '<label class="check"><input type="checkbox" data-change="territory" data-id="' + esc(m.id) + '"' + (m.territoryAdmin ? ' checked' : '') + '>共有カード管理者に任命</label>' +
+        (m.role === 'admin' ? '' : '<label class="check"><input type="checkbox" data-change="library" data-id="' + esc(m.id) + '"' + (m.libraryAdmin ? ' checked' : '') + '>資料箱管理者に任命（資料の追加・整理ができる）</label>') +
         (m.role === 'admin'
           ? '<div class="muted small">全体管理者は予定の追加・変更もできます</div>'
           : '<label class="check"><input type="checkbox" data-change="calendar" data-id="' + esc(m.id) + '"' + (m.calendarEditor ? ' checked' : '') + '>カレンダー編集者に任命（全体の予定を追加・変更できる）</label>') +
@@ -2770,6 +2939,15 @@
         ICON_URL = a.iconUrl;
         toast('保存しました。アプリを開き直すと反映されます。');
         render();
+      });
+    },
+    libItem: function (f) {
+      keepLibForm();
+      var d = state.libForm;
+      var data = { id: d.item ? d.item.id : '', shelfId: d.shelfId, title: d.title, kind: d.kind, url: d.url, note: d.note, pinned: d.pinned, fileId: d.files[0] ? d.files[0].id : '' };
+      return run('api_saveLibItem', state.token, data).then(function () {
+        toast('保存しました。');
+        go('library');
       });
     },
     profile: function (f) {
@@ -2910,7 +3088,7 @@
       });
     },
     dialog: function (fm) {
-      var vals = Array.prototype.map.call(fm.querySelectorAll('input,textarea'), function (x) { return x.value; });
+      var vals = Array.prototype.map.call(fm.querySelectorAll('input,textarea,select'), function (x) { return x.value; });
       closeFormDialog(vals);
       return Promise.resolve();
     },
@@ -2947,8 +3125,16 @@
     terrEdit: function (fm) {
       var e = state.terrEdit;
       var c = e.card;
-      if (c && c.type === 'map') {
-        return run('api_updateTerritory', state.token, c.id, fm.number.value, fm.name.value).then(function () {
+      var lend = fm.lendable ? fm.lendable.checked : null;
+      if (!c && e.type === 'link') {
+        return run('api_saveLinkCard', state.token, fm.number.value, fm.name.value, fm.link.value, lend).then(function (id) {
+          toast('リンクを登録しました。');
+          state.terrAdmin = null;
+          openTerr(id, 'territory');
+        });
+      }
+      if (c && c.type !== 'list') {
+        return run('api_updateTerritory', state.token, c.id, fm.number.value, fm.name.value, lend, fm.link ? fm.link.value : null).then(function () {
           toast('保存しました。');
           openTerr(c.id, 'territory');
         });
@@ -2961,7 +3147,7 @@
         });
       }
       return run('api_saveListCard', state.token, c ? c.id : '', fm.number.value, fm.name.value, url).then(function (id) {
-        toast(c ? '保存しました。' : 'リスト型の区域を登録しました。');
+        toast(c ? '保存しました。' : '表を登録しました。');
         state.terrAdmin = null;
         openTerr(id, 'territory');
       });
@@ -2994,6 +3180,47 @@
           });
         });
       });
+    },
+    newLibItem: function () {
+      var L = state.lib;
+      state.libForm = { item: null, shelfId: L.shelves[0].id, title: '', kind: 'link', url: '', note: '', pinned: false, files: [] };
+      go('libItemForm');
+    },
+    editLibItem: function (el) {
+      var it = state.lib.items.filter(function (x) { return x.id === el.getAttribute('data-id'); })[0];
+      if (!it) return;
+      state.libForm = { item: it, shelfId: it.shelfId, title: it.title, kind: it.kind, url: it.url, note: it.note, pinned: it.pinned, files: it.file ? [it.file] : [] };
+      go('libItemForm');
+    },
+    deleteLibItem: function () {
+      var it = state.libForm.item;
+      return choose('「' + it.title + '」を削除しますか？', [['ok', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteLibItem', state.token, it.id).then(function () {
+          toast('削除しました。');
+          go('library');
+        });
+      });
+    },
+    newShelf: function () {
+      return shelfDialog(null);
+    },
+    editShelf: function (el) {
+      var sh = state.lib.shelves.filter(function (x) { return x.id === el.getAttribute('data-id'); })[0];
+      return shelfDialog(sh);
+    },
+    deleteShelf: function (el) {
+      var sh = state.lib.shelves.filter(function (x) { return x.id === el.getAttribute('data-id'); })[0];
+      return choose('棚「' + sh.name + '」を削除しますか？', [['ok', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteShelf', state.token, sh.id).then(function () {
+          toast('削除しました。');
+          return loadLibrary();
+        });
+      });
+    },
+    moveShelf: function (el) {
+      return run('api_moveShelf', state.token, el.getAttribute('data-id'), Number(el.getAttribute('data-d'))).then(loadLibrary);
     },
     logout: function () {
       var t = state.token;
@@ -3179,14 +3406,14 @@
         return run('api_deleteMessage', state.token, id).then(function (r) { applyChat(r, false); });
       });
     },
-    // 区域カード
+    // 共有カード
     openTerr: function (el) {
       return openTerr(el.getAttribute('data-id'));
     },
     borrowTerr: function (el) {
       var id = el.getAttribute('data-id');
       var c = (state.terr && state.terr.cards || []).filter(function (x) { return x.id === id; })[0] || state.terrCard;
-      return choose((c ? terrTitle(c) : 'この区域') + 'を借りますか？', [['ok', '借りる', 'primary']]).then(function (k) {
+      return choose((c ? terrTitle(c) : 'このカード') + 'を借りますか？', [['ok', '借りる', 'primary']]).then(function (k) {
         if (!k) return;
         return run('api_borrowTerritory', state.token, id).then(function () {
           toast('借りました。返却期限は' + (state.terr ? state.terr.dueDays : '') + '日後です。');
@@ -3252,7 +3479,7 @@
       drawInk();
     },
     inkClear: function () {
-      return choose('この区域の地図の書き込みをすべて消しますか？', [['ok', 'すべて消す', 'danger']]).then(function (k) {
+      return choose('このカードの画像の書き込みをすべて消しますか？', [['ok', 'すべて消す', 'danger']]).then(function (k) {
         if (!k) return;
         ink.items = [];
         ink.history = [];
@@ -3349,7 +3576,11 @@
       go('terrEdit');
     },
     newListTerr: function () {
-      state.terrEdit = { card: null };
+      state.terrEdit = { card: null, type: 'list' };
+      go('terrEdit');
+    },
+    newLinkTerr: function () {
+      state.terrEdit = { card: null, type: 'link' };
       go('terrEdit');
     },
     deleteTerr: function () {
@@ -3571,7 +3802,7 @@
         var name = (row.getAttribute('data-name') || '').toLowerCase();
         if (!tq) return true;
         if (nq) {
-          // 番号で探すとき：「3」は区域3とその枝番、「3-2」は区域3-2だけ
+          // 番号で探すとき：「3」はカード3とその枝番、「3-2」はカード3-2だけ
           var no = name.split(' ')[0];
           return no === nq || (nq.indexOf('-') < 0 && no.split('-')[0] === nq);
         }
@@ -3594,6 +3825,18 @@
           box.hidden = !open;
           btn.setAttribute('aria-expanded', String(open));
         });
+      });
+    }
+    if (el.getAttribute('data-filter') === 'lib') {
+      var lq = el.value.trim().toLowerCase();
+      Array.prototype.forEach.call(document.querySelectorAll('.lib-shelf'), function (sh) {
+        var any = false;
+        Array.prototype.forEach.call(sh.querySelectorAll('.lib-item'), function (row) {
+          var ok = !lq || (row.getAttribute('data-name') || '').toLowerCase().indexOf(lq) >= 0;
+          row.hidden = !ok;
+          if (ok) any = true;
+        });
+        sh.hidden = !!lq && !any;
       });
     }
     if (el.getAttribute('data-filter') === 'users') {
@@ -3622,6 +3865,8 @@
     if (kind === 'role') updateMember(id, { role: el.value }).catch(function () {});
     if (kind === 'territory') updateMember(id, { territoryAdmin: el.checked }).catch(function () {});
     if (kind === 'calendar') updateMember(id, { calendarEditor: el.checked }).catch(function () {});
+    if (kind === 'library') updateMember(id, { libraryAdmin: el.checked }).catch(function () {});
+    if (kind === 'libKind') { keepLibForm(); state.libForm.kind = el.value; render(); }
     if (kind === 'digest') {
       var on = el.checked;
       run('api_setDigest', state.token, on).then(function (u) {

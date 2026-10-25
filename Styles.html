@@ -253,6 +253,20 @@
   .dialog[hidden] { display: none; }
   .dialog-box { width: 100%; max-width: 420px; background: var(--card); border-radius: 16px; padding: 20px 16px 8px; display: flex; flex-direction: column; gap: 10px; margin-bottom: env(safe-area-inset-bottom); }
   .dialog-msg { font-size: 15px; font-weight: 700; text-align: center; padding-bottom: 4px; white-space: pre-line; }
+  .lib-list { padding: 4px 0; }
+  .lib-item { display: flex; align-items: center; gap: 4px; padding: 0 8px 0 0; border-bottom: 1px solid var(--line-soft); }
+  .lib-item:last-child { border-bottom: none; }
+  .lib-open { flex: 1; display: flex; align-items: center; gap: 12px; min-height: 56px; padding: 8px 12px; border: none; background: none; text-align: left; font: inherit; color: var(--text); text-decoration: none; cursor: pointer; }
+  .lib-icon { flex: none; width: 36px; height: 36px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); display: flex; align-items: center; justify-content: center; }
+  .lib-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .lib-title { font-weight: 500; overflow-wrap: anywhere; }
+  .lib-star { color: #C79A2B; margin-right: 4px; vertical-align: -2px; }
+  .shelf-row { display: flex; align-items: center; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+  .shelf-row:last-child { border-bottom: none; }
+  .shelf-name { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .credit { margin-top: 8px; text-align: center; font-size: 12px; color: var(--muted); line-height: 1.8; }
+  .credit a, .about a:not(.btn) { color: var(--accent); }
+  .about-head { display: flex; justify-content: space-between; align-items: baseline; }
   .file-expired { font-size: 12px; color: var(--muted); padding: 6px 2px 2px; }
   .msg.mine .file-expired { color: rgba(255,255,255,.8); }
   .dialog-msg.left { text-align: left; font-weight: 500; }
@@ -334,7 +348,7 @@
   .composer-send { width: 44px; height: 44px; border: none; border-radius: 22px; background: var(--accent); color: #FFF; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; }
   .composer-send:disabled { opacity: 0.5; }
 
-  /* 区域カード */
+  /* 共有カード */
   .terr-banner { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; border-radius: 12px; background: var(--accent); color: #FFF; }
   .terr-banner .big { font-size: 17px; font-weight: 700; }
   .terr-banner .right { text-align: right; }

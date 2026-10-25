@@ -4,8 +4,9 @@
  *  第2段階：掲示板・お知らせ・コメント（画像・PDFの添付つき）
  *  第3段階：カレンダー（繰り返し予定つき）
  *  第4段階：グループ・メッセージ（1対1・グループ、既読つき）
- *  第5段階：区域カード（貸し出し・返却、地図への書き込み、コメント、スプレッドシート連携）
+ *  第5段階：共有カード（図面・画像／表／リンク。カードごとに借りる・返すを使える。書き込み・コメント）
  *  第6段階：未読のまとめメール（朝7時・夕方18時に自動送信）
+ *  第7段階：資料箱（分類ごとにリンク・ファイルを整理して共有）
  *
  * 初回のみ：エディタ上部で関数「setup」を選んで実行し、
  * 実行ログに表示される「初期管理者の招待コード」でアプリに登録してください。
@@ -18,7 +19,7 @@ const HASH_ROUNDS = 300;            // パスワードのハッシュ計算の�
 const MAX_LOGIN_FAILS = 5;          // この回数失敗すると10分ロック
 
 const SHEETS = {
-  Users: ['id', 'loginId', 'name', 'email', 'passHash', 'salt', 'role', 'territoryAdmin', 'active', 'createdAt', 'lastLoginAt', 'calendarEditor', 'digestOff', 'lastDigestAt', 'withdrawnAt'],
+  Users: ['id', 'loginId', 'name', 'email', 'passHash', 'salt', 'role', 'territoryAdmin', 'active', 'createdAt', 'lastLoginAt', 'calendarEditor', 'digestOff', 'lastDigestAt', 'withdrawnAt', 'libraryAdmin'],
   Invites: ['code', 'role', 'createdBy', 'createdAt', 'expiresAt', 'usedBy', 'usedAt', 'note'],
   Sessions: ['token', 'userId', 'createdAt', 'expiresAt'],
   Posts: ['id', 'type', 'title', 'body', 'authorId', 'important', 'createdAt', 'updatedAt', 'deleted', 'groupId'],
@@ -33,15 +34,17 @@ const SHEETS = {
   DmPairs: ['id', 'userA', 'userB', 'createdAt'],
   Messages: ['id', 'convId', 'authorId', 'body', 'createdAt', 'deleted'],
   ChatReads: ['convId', 'userId', 'lastReadAt'],
-  Territories: ['id', 'number', 'name', 'type', 'fileId', 'sheetId', 'sheetGid', 'sheetUrl', 'available',
+  Cards: ['id', 'number', 'name', 'type', 'fileId', 'sheetId', 'sheetGid', 'sheetUrl', 'available',
     'holderId', 'holderName', 'borrowedAt', 'dueDate', 'lastUserId', 'lastUserName', 'lastUsedDate', 'lastReturnedAt',
-    'createdAt', 'updatedAt', 'deleted'],
-  TerritoryLog: ['id', 'territoryId', 'userId', 'userName', 'borrowedAt', 'dueDate', 'returnedAt', 'usedDate', 'operatorId'],
-  TerritoryComments: ['id', 'territoryId', 'authorId', 'body', 'warn', 'createdAt', 'deleted'],
-  TerritoryInk: ['territoryId', 'data', 'updatedAt', 'updatedBy']
+    'createdAt', 'updatedAt', 'deleted', 'lendable', 'linkUrl'],
+  CardLog: ['id', 'territoryId', 'userId', 'userName', 'borrowedAt', 'dueDate', 'returnedAt', 'usedDate', 'operatorId'],
+  CardComments: ['id', 'territoryId', 'authorId', 'body', 'warn', 'createdAt', 'deleted'],
+  CardInk: ['territoryId', 'data', 'updatedAt', 'updatedBy'],
+  LibShelves: ['id', 'name', 'groupId', 'sortOrder', 'createdAt', 'deleted'],
+  LibItems: ['id', 'shelfId', 'title', 'kind', 'url', 'fileId', 'note', 'pinned', 'createdBy', 'createdAt', 'updatedAt', 'deleted']
 };
 
-// 区域カード
+// 共有カード
 const DEFAULT_DUE_DAYS = 14;
 const COMMENT_AFTER_RETURN_HOURS = 72;   // 返却した人がコメントを追加できる時間
 const MAX_INK_CHARS = 45000;             // 書き込みデータの上限（スプレッドシートのセルの上限より小さく）
@@ -79,8 +82,8 @@ function doGet() {
 
 // ===== アプリの設定（全体管理者） =====
 // 機能のオン・オフ（アプリ全体）
-const APP_FEATURES = ['board', 'calendar', 'chat', 'groups', 'cards'];
-const APP_FEATURE_NAMES = { board: '掲示板', calendar: '予定', chat: 'メッセージ', groups: 'グループ', cards: '共有カード' };
+const APP_FEATURES = ['board', 'calendar', 'chat', 'groups', 'cards', 'library'];
+const APP_FEATURE_NAMES = { board: '掲示板', calendar: '予定', chat: 'メッセージ', groups: 'グループ', cards: '共有カード', library: '資料箱' };
 let featuresCache_ = null;
 function appFeatures_() {
   if (featuresCache_) return featuresCache_;
@@ -313,7 +316,7 @@ function api_withdraw(token, password) {
   try {
     const holding = liveTerritories_().filter(function (t) { return isLendable_(t) && t.holderId === u.id; });
     if (holding.length) {
-      throw new Error('借りている区域カード（' + holding.map(function (t) { return t.number; }).join('・') + '）を返却してから退会してください。');
+      throw new Error('借りている共有カード（' + holding.map(function (t) { return t.number; }).join('・') + '）を返却してから退会してください。');
     }
     if (u.role === 'admin') {
       const others = readRows_('Users').filter(function (r) { return r.id !== u.id && r.role === 'admin' && r.active === '1'; });
@@ -378,6 +381,9 @@ function api_updateMember(token, userId, changes) {
     }
     if (changes.territoryAdmin !== undefined) {
       u.territoryAdmin = changes.territoryAdmin ? '1' : '0';
+    }
+    if (changes.libraryAdmin !== undefined) {
+      u.libraryAdmin = changes.libraryAdmin ? '1' : '0';
     }
     if (changes.calendarEditor !== undefined) {
       u.calendarEditor = changes.calendarEditor ? '1' : '0';
@@ -1192,6 +1198,8 @@ function api_getFile(token, fileId) {
         const c = readRows_('Comments').find(function (r) { return r.id === f.ownerId && r.deleted !== '1'; });
         if (!c) notFound();
         findPostFor_(u, c.postId, myGroups);
+      } else if (f.ownerType === 'library') {
+        findLibItemFor_(u, f.ownerId, myGroups);
       } else if (f.ownerType === 'territory') {
         findTerritoryFor_(u, f.ownerId);
       } else if (f.ownerType === 'message') {
@@ -1525,7 +1533,7 @@ function digestFor_(u, since, withTerritory) {
     return { title: title, count: chat[id] };
   }).sort(function (a, b) { return b.count - a.count; });
   const chatTotal = chatList.reduce(function (n, c) { return n + c.count; }, 0);
-  // 区域カード（朝の分だけ）
+  // 共有カード（朝の分だけ）
   const terr = withTerritory ? terrSummary_(u).alerts : [];
   return {
     board: board, chatList: chatList, chatTotal: chatTotal, terr: terr, newCount: newCount,
@@ -1536,9 +1544,9 @@ function digestFor_(u, since, withTerritory) {
 function digestBody_(u, d) {
   const lines = [u.name + 'さん', '', appName_() + 'の未読のお知らせです。', ''];
   if (d.terr.length) {
-    lines.push('■ 区域カード');
+    lines.push('■ 共有カード');
     d.terr.forEach(function (a) {
-      const label = '区域' + a.number + (a.name ? '（' + a.name + '）' : '');
+      const label = 'No.' + a.number + (a.name ? '（' + a.name + '）' : '');
       const msg = a.kind === 'return' ? '貸出対象外になりました。返却をお願いします'
         : a.kind === 'overdue' ? '返却期限（' + a.dueDate + '）を過ぎています'
         : '返却期限（' + a.dueDate + '）が近づいています';
@@ -1574,11 +1582,11 @@ function digestBody_(u, d) {
 
 function digestSubject_(d) {
   const parts = [];
-  if (d.urgent) parts.push('区域カードの返却');
+  if (d.urgent) parts.push('共有カードの返却');
   if (d.chatTotal) parts.push('メッセージ' + d.chatTotal + '件');
   const b = d.board.board + d.board.notice + d.board.group;
   if (b) parts.push('掲示板' + b + '件');
-  if (!parts.length && d.terr.length) parts.push('区域カードの返却期限');
+  if (!parts.length && d.terr.length) parts.push('共有カードの返却期限');
   return '【' + appName_() + '】未読のお知らせ（' + parts.join('・') + '）';
 }
 
@@ -1597,11 +1605,11 @@ function runDigest() {
     readRows_('Users').forEach(function (u) {
       if (u.active !== '1' || !u.email || u.digestOff === '1') return;
       const d = digestFor_(u, u.lastDigestAt, morning);
-      // 前回のメール以降に新しい未読がない人には送らない（区域カードの知らせは朝に毎日送る）
+      // 前回のメール以降に新しい未読がない人には送らない（共有カードの知らせは朝に毎日送る）
       if (!d.newCount && !d.terr.length) return;
       candidates.push({ u: u, d: d });
     });
-    // 送信数の上限を超えそうなときは、区域カードの返却が必要な人 → 未読の多い人の順に送る
+    // 送信数の上限を超えそうなときは、共有カードの返却が必要な人 → 未読の多い人の順に送る
     candidates.sort(function (a, b) {
       if (a.d.urgent !== b.d.urgent) return a.d.urgent ? -1 : 1;
       return (b.d.chatTotal + b.d.newCount) - (a.d.chatTotal + a.d.newCount);
@@ -1648,13 +1656,13 @@ function api_sendDigestTest(token) {
   return u.email;
 }
 
-// ===== 区域カード =====
+// ===== 共有カード =====
 function isTerrAdmin_(u) {
   return u.territoryAdmin === '1';
 }
 
 function requireTerrAdmin_(u) {
-  if (!isTerrAdmin_(u)) throw new Error('この操作は区域カード管理者のみ行えます。');
+  if (!isTerrAdmin_(u)) throw new Error('この操作は共有カード管理者のみ行えます。');
 }
 
 function todayJst_() {
@@ -1667,7 +1675,7 @@ function dueDays_() {
 }
 
 function liveTerritories_() {
-  return readRows_('Territories').filter(function (t) { return t.deleted !== '1'; })
+  return readRows_('Cards').filter(function (t) { return t.deleted !== '1'; })
     .sort(function (a, b) { return compareTerr_(a.number, b.number); });
 }
 
@@ -1678,17 +1686,17 @@ function recentlyReturnedBy_(t, u) {
 
 // 一般メンバーに見えるのは「貸出対象」「自分が借りている」「自分が最近返した」カード。リストは全員が見られる
 function canSeeTerritory_(u, t) {
-  return t.type === 'list' || isTerrAdmin_(u) || t.available === '1' || t.holderId === u.id || recentlyReturnedBy_(t, u);
+  return !isLendable_(t) || isTerrAdmin_(u) || t.available === '1' || t.holderId === u.id || recentlyReturnedBy_(t, u);
 }
 
-// 地図型（貸し出しする区域カード）か
+// 借りる・返すを使うカードか（カードごとに設定。リストは使わない）
 function isLendable_(t) {
-  return t.type !== 'list';
+  return t.type !== 'list' && t.lendable !== '0';
 }
 
 function findTerritoryFor_(u, id) {
   const t = liveTerritories_().find(function (r) { return r.id === id; });
-  if (!t || !canSeeTerritory_(u, t)) throw new Error('区域カードが見つかりません。');
+  if (!t || !canSeeTerritory_(u, t)) throw new Error('共有カードが見つかりません。');
   return t;
 }
 
@@ -1696,7 +1704,7 @@ function terrView_(u, t, names, warnCounts, commentCounts) {
   if (!isLendable_(t)) {
     // リストは貸し出しをしない（借りる・返却・期限の情報は持たない）
     return {
-      id: t.id, number: String(t.number), name: t.name, type: t.type, available: false,
+      id: t.id, number: String(t.number), name: t.name, type: t.type, lendable: false, available: false,
       held: false, heldByMe: false, holderName: '', borrowedAt: '', dueDate: '', overdue: false, needReturn: false,
       lastUserName: '', lastUsedDate: '',
       warnCount: warnCounts[t.id] || 0, commentCount: commentCounts[t.id] || 0
@@ -1707,7 +1715,7 @@ function terrView_(u, t, names, warnCounts, commentCounts) {
   const holderName = t.holderId ? (names[t.holderId] || '（退会したメンバー）') : t.holderName;
   const lastName = t.lastUserId ? (names[t.lastUserId] || t.lastUserName || '') : t.lastUserName;
   return {
-    id: t.id, number: String(t.number), name: t.name, type: t.type,
+    id: t.id, number: String(t.number), name: t.name, type: t.type, lendable: true,
     available: t.available === '1',
     held: held, heldByMe: t.holderId === u.id,
     holderName: holderName || '', borrowedAt: t.borrowedAt, dueDate: t.dueDate,
@@ -1721,7 +1729,7 @@ function terrView_(u, t, names, warnCounts, commentCounts) {
 function terrCounts_() {
   const warn = {};
   const all = {};
-  readRows_('TerritoryComments').forEach(function (c) {
+  readRows_('CardComments').forEach(function (c) {
     if (c.deleted === '1') return;
     all[c.territoryId] = (all[c.territoryId] || 0) + 1;
     if (c.warn === '1') warn[c.territoryId] = (warn[c.territoryId] || 0) + 1;
@@ -1765,15 +1773,16 @@ function api_territory(token, id) {
   const v = terrView_(u, t, names, counts.warn, counts.all);
   const admin = isTerrAdmin_(u);
   v.fileId = t.type === 'map' ? t.fileId : '';
+  v.linkUrl = t.type === 'link' ? t.linkUrl : '';
   v.isAdmin = admin;
   const lendable = isLendable_(t);
-  v.canInk = lendable && (admin || t.holderId === u.id);
+  v.canInk = t.type === 'map' && (admin || (lendable && t.holderId === u.id));   // 貸し出ししない図面は、管理者だけが書き込む
   v.canComment = !lendable || admin || t.holderId === u.id || recentlyReturnedBy_(t, u);
   v.canBorrow = lendable && t.available === '1' && !v.held;
   v.canReturn = lendable && v.held && (t.holderId === u.id || admin);
   // リストのURLは全員に渡す（開けるのはスプレッドシートを共有されている人だけ）
   v.sheetUrl = t.type === 'list' ? t.sheetUrl : '';
-  const ink = readRows_('TerritoryInk').find(function (r) { return r.territoryId === t.id; });
+  const ink = readRows_('CardInk').find(function (r) { return r.territoryId === t.id; });
   v.ink = ink ? ink.data : '';
   v.comments = terrComments_(u, t.id, names);
   if (t.type === 'list') {
@@ -1781,7 +1790,7 @@ function api_territory(token, id) {
       v.list = readListSheet_(t);
     } catch (e) {
       v.list = null;
-      v.listError = 'スプレッドシートを読み込めませんでした。区域カード管理者に、URLと共有設定の確認を依頼してください。';
+      v.listError = 'スプレッドシートを読み込めませんでした。共有カード管理者に、URLと共有設定の確認を依頼してください。';
     }
   }
   return v;
@@ -1794,9 +1803,9 @@ function api_borrowTerritory(token, id) {
   lock.waitLock(15000);
   try {
     const t = findTerritoryFor_(u, id);
-    if (!isLendable_(t)) throw new Error('リストは借りずに、そのまま使えます。');
-    if (t.available !== '1') throw new Error('この区域は現在、貸出対象ではありません。');
-    if (t.holderId || t.holderName) throw new Error('この区域は、すでに他の人が借りています。');
+    if (!isLendable_(t)) throw new Error('このカードは借りずに、そのまま使えます。');
+    if (t.available !== '1') throw new Error('このカードは現在、貸出対象ではありません。');
+    if (t.holderId || t.holderName) throw new Error('このカードは、すでに他の人が借りています。');
     lend_(t, u.id, '', u.id);
     return true;
   } finally {
@@ -1811,8 +1820,8 @@ function lend_(t, userId, name, operatorId) {
   t.borrowedAt = now;
   t.dueDate = shiftDate_(todayJst_(), dueDays_());
   t.updatedAt = now;
-  updateRow_('Territories', t._row, t);
-  appendRow_('TerritoryLog', {
+  updateRow_('Cards', t._row, t);
+  appendRow_('CardLog', {
     id: 'l' + randomToken_().slice(0, 15), territoryId: t.id, userId: t.holderId, userName: t.holderName,
     borrowedAt: now, dueDate: t.dueDate, returnedAt: '', usedDate: '', operatorId: operatorId
   });
@@ -1824,18 +1833,18 @@ function api_returnTerritory(token, id, usedDate) {
   lock.waitLock(15000);
   try {
     const t = findTerritoryFor_(u, id);
-    if (!t.holderId && !t.holderName) throw new Error('この区域は貸し出されていません。');
-    if (t.holderId !== u.id && !isTerrAdmin_(u)) throw new Error('借りている人か区域カード管理者だけが返却できます。');
+    if (!t.holderId && !t.holderName) throw new Error('このカードは貸し出されていません。');
+    if (t.holderId !== u.id && !isTerrAdmin_(u)) throw new Error('借りている人か共有カード管理者だけが返却できます。');
     usedDate = String(usedDate || '');
     if (usedDate && !isDate_(usedDate)) throw new Error('使った日を正しく入力してください。');
     if (usedDate && usedDate > todayJst_()) throw new Error('使った日に、未来の日付は入れられません。');
     const now = nowIso_();
-    const log = readRows_('TerritoryLog').filter(function (r) { return r.territoryId === t.id && !r.returnedAt; })
+    const log = readRows_('CardLog').filter(function (r) { return r.territoryId === t.id && !r.returnedAt; })
       .sort(function (a, b) { return a.borrowedAt < b.borrowedAt ? 1 : -1; })[0];
     if (log) {
       log.returnedAt = now;
       log.usedDate = usedDate;
-      updateRow_('TerritoryLog', log._row, log);
+      updateRow_('CardLog', log._row, log);
     }
     t.lastUserId = t.holderId;
     t.lastUserName = t.holderId ? '' : t.holderName;
@@ -1846,14 +1855,14 @@ function api_returnTerritory(token, id, usedDate) {
     t.borrowedAt = '';
     t.dueDate = '';
     t.updatedAt = now;
-    updateRow_('Territories', t._row, t);
+    updateRow_('Cards', t._row, t);
     return true;
   } finally {
     lock.releaseLock();
   }
 }
 
-// 区域カード管理者：アプリを使わない人の分も含めて代理で貸し出す
+// 共有カード管理者：アプリを使わない人の分も含めて代理で貸し出す
 function api_lendTerritory(token, id, userId, name) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
@@ -1865,8 +1874,8 @@ function api_lendTerritory(token, id, userId, name) {
   lock.waitLock(15000);
   try {
     const t = findTerritoryFor_(u, id);
-    if (!isLendable_(t)) throw new Error('リストは貸し出しをしません。');
-    if (t.holderId || t.holderName) throw new Error('この区域は、すでに貸し出し中です。先に返却してください。');
+    if (!isLendable_(t)) throw new Error('このカードは貸し出しをしません。');
+    if (t.holderId || t.holderName) throw new Error('このカードは、すでに貸し出し中です。先に返却してください。');
     lend_(t, userId, userId ? '' : name, u.id);
     return true;
   } finally {
@@ -1878,7 +1887,7 @@ function api_territoryHistory(token, id) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
   const names = userNames_();
-  return readRows_('TerritoryLog').filter(function (r) { return r.territoryId === id; })
+  return readRows_('CardLog').filter(function (r) { return r.territoryId === id; })
     .sort(function (a, b) { return a.borrowedAt < b.borrowedAt ? 1 : -1; })
     .slice(0, 50).map(function (r) {
       return {
@@ -1889,7 +1898,7 @@ function api_territoryHistory(token, id) {
     });
 }
 
-// 区域カード管理者：貸出対象をまとめて設定（ids に含まれるものだけ対象にする）
+// 共有カード管理者：貸出対象をまとめて設定（ids に含まれるものだけ対象にする）
 function api_setAvailable(token, ids) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
@@ -1898,8 +1907,8 @@ function api_setAvailable(token, ids) {
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
   try {
-    const sh = sheet_('Territories');
-    const col = SHEETS.Territories.indexOf('available') + 1;
+    const sh = sheet_('Cards');
+    const col = SHEETS.Cards.indexOf('available') + 1;
     let changed = 0;
     liveTerritories_().forEach(function (t) {
       const v = set[t.id] && isLendable_(t) ? '1' : '0';
@@ -1908,7 +1917,7 @@ function api_setAvailable(token, ids) {
         changed++;
       }
     });
-    delete rowsCache_.Territories;
+    delete rowsCache_.Cards;
     return changed;
   } finally {
     lock.releaseLock();
@@ -1924,15 +1933,15 @@ function api_setDueDays(token, days) {
   return days;
 }
 
-// 区域番号：「12」または枝番つきの「1-1」。全角数字や「_」「ー」などの区切りもそろえる
+// 番号：「12」または枝番つきの「1-1」。全角数字や「_」「ー」などの区切りもそろえる
 function cleanTerrNumber_(n) {
   let v = String(n === undefined || n === null ? '' : n).trim()
     .replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
     .replace(/\s*[_‐－ー−―\-]\s*/g, '-');
   const m = v.match(/^(\d{1,4})(?:-(\d{1,3}))?$/);
-  if (!m) throw new Error('区域番号は「12」または「1-1」のように入力してください。');
+  if (!m) throw new Error('番号は「12」または「1-1」のように入力してください。');
   const main = Number(m[1]);
-  if (main < 1) throw new Error('区域番号は1以上にしてください。');
+  if (main < 1) throw new Error('番号は1以上にしてください。');
   return m[2] ? main + '-' + Number(m[2]) : String(main);
 }
 
@@ -1948,31 +1957,32 @@ function compareTerr_(a, b) {
 
 function cleanTerrName_(s) {
   s = String(s || '').trim();
-  if (s.length > 40) throw new Error('区域の名前は40文字以内にしてください。');
+  if (s.length > 40) throw new Error('カードの名前は40文字以内にしてください。');
   return s;
 }
 
 // 地図型カードの登録（同じ番号があれば replace=true のとき地図を差し替え）
-function api_saveMapCard(token, number, name, mime, base64, replace) {
+function api_saveMapCard(token, number, name, mime, base64, replace, lendable) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
   number = cleanTerrNumber_(number);
   name = cleanTerrName_(name);
-  if (['image/jpeg', 'image/png'].indexOf(mime) < 0) throw new Error('地図は画像（JPG・PNG）で登録してください。');
+  if (['image/jpeg', 'image/png'].indexOf(mime) < 0) throw new Error('画像は画像（JPG・PNG）で登録してください。');
   const bytes = Utilities.base64Decode(String(base64 || ''));
   if (!bytes.length) throw new Error('ファイルが空です。');
-  if (bytes.length > MAX_FILE_BYTES) throw new Error('地図の画像が大きすぎます（5MBまで）。');
+  if (bytes.length > MAX_FILE_BYTES) throw new Error('画像の画像が大きすぎます（5MBまで）。');
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
-    const exist = liveTerritories_().find(function (t) { return isLendable_(t) && String(t.number) === number; });
-    if (exist && !replace) throw new Error('区域' + number + 'はすでに登録されています。');
-    const file = folder_().createFile(Utilities.newBlob(bytes, mime, '区域' + number + (mime === 'image/png' ? '.png' : '.jpg')));
+    const exist = liveTerritories_().find(function (t) { return String(t.number) === number; });
+    if (exist && exist.type !== 'map') throw new Error('No.' + number + 'は、ほかの種類のカードとして登録されています。');
+    if (exist && !replace) throw new Error('No.' + number + 'はすでに登録されています。');
+    const file = folder_().createFile(Utilities.newBlob(bytes, mime, 'No.' + number + (mime === 'image/png' ? '.png' : '.jpg')));
     const now = nowIso_();
     const id = exist ? exist.id : 't' + randomToken_().slice(0, 15);
     const rec = {
       id: 'f_' + randomToken_().slice(0, 16), driveId: file.getId(), ownerType: 'territory', ownerId: id,
-      name: '区域' + number, mime: mime, size: String(bytes.length), uploadedBy: u.id, createdAt: now, deleted: ''
+      name: 'No.' + number, mime: mime, size: String(bytes.length), uploadedBy: u.id, createdAt: now, deleted: ''
     };
     appendRow_('Files', rec);
     if (exist) {
@@ -1981,10 +1991,10 @@ function api_saveMapCard(token, number, name, mime, base64, replace) {
       exist.fileId = rec.id;
       if (name) exist.name = name;
       exist.updatedAt = now;
-      updateRow_('Territories', exist._row, exist);
+      updateRow_('Cards', exist._row, exist);
       return { id: id, replaced: true };
     }
-    appendRow_('Territories', newTerritory_(id, number, name, 'map', now, { fileId: rec.id }));
+    appendRow_('Cards', newTerritory_(id, number, name, 'map', now, { fileId: rec.id, lendable: lendable === false ? '0' : '1' }));
     return { id: id, replaced: false };
   } finally {
     lock.releaseLock();
@@ -1993,13 +2003,39 @@ function api_saveMapCard(token, number, name, mime, base64, replace) {
 
 function newTerritory_(id, number, name, type, now, extra) {
   const t = {
-    id: id, number: String(number), name: name, type: type, fileId: '', sheetId: '', sheetGid: '', sheetUrl: '',
-    available: '0', holderId: '', holderName: '', borrowedAt: '', dueDate: '',
+    id: id, number: String(number), name: name, type: type, fileId: '', sheetId: '', sheetGid: '', sheetUrl: '', linkUrl: '',
+    lendable: type === 'list' ? '0' : '1',
+    available: '1',   // 登録したカードは、最初から貸し出しできる holderId: '', holderName: '', borrowedAt: '', dueDate: '',
     lastUserId: '', lastUserName: '', lastUsedDate: '', lastReturnedAt: '',
     createdAt: now, updatedAt: now, deleted: ''
   };
   Object.keys(extra || {}).forEach(function (k) { t[k] = extra[k]; });
   return t;
+}
+
+function cleanLinkUrl_(url) {
+  url = String(url || '').trim();
+  if (!/^https?:\/\/\S+$/i.test(url) || url.length > 2000) throw new Error('リンクは「https://」から始まるURLを入力してください。');
+  return url;
+}
+
+// リンクのカード（Googleドライブ・フォーム・マイマップ・Webページなど）
+function api_saveLinkCard(token, number, name, url, lendable) {
+  const u = requireUser_(token);
+  requireTerrAdmin_(u);
+  number = cleanTerrNumber_(number);
+  name = cleanTerrName_(name);
+  url = cleanLinkUrl_(url);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    if (liveTerritories_().some(function (t) { return String(t.number) === number; })) throw new Error('No.' + number + 'はすでに登録されています。');
+    const nid = 't' + randomToken_().slice(0, 15);
+    appendRow_('Cards', newTerritory_(nid, number, name, 'link', nowIso_(), { linkUrl: url, lendable: lendable ? '1' : '0' }));
+    return nid;
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function parseSheetUrl_(url) {
@@ -2026,44 +2062,51 @@ function api_saveListCard(token, id, number, name, url) {
   lock.waitLock(15000);
   try {
     const all = liveTerritories_();
-    const dup = all.find(function (t) { return t.type === 'list' && String(t.number) === number && t.id !== id; });
+    const dup = all.find(function (t) { return String(t.number) === number && t.id !== id; });
     if (dup) throw new Error('リスト' + number + 'はすでに登録されています。');
     const now = nowIso_();
     if (id) {
       const t = all.find(function (r) { return r.id === id; });
-      if (!t || t.type !== 'list') throw new Error('区域カードが見つかりません。');
+      if (!t || t.type !== 'list') throw new Error('共有カードが見つかりません。');
       t.number = String(number);
       t.name = name;
       t.sheetId = sheet.id;
       t.sheetGid = sheet.gid;
       t.sheetUrl = sheet.url;
       t.updatedAt = now;
-      updateRow_('Territories', t._row, t);
+      updateRow_('Cards', t._row, t);
       return t.id;
     }
     const nid = 't' + randomToken_().slice(0, 15);
-    appendRow_('Territories', newTerritory_(nid, number, name, 'list', now, { sheetId: sheet.id, sheetGid: sheet.gid, sheetUrl: sheet.url }));
+    appendRow_('Cards', newTerritory_(nid, number, name, 'list', now, { sheetId: sheet.id, sheetGid: sheet.gid, sheetUrl: sheet.url }));
     return nid;
   } finally {
     lock.releaseLock();
   }
 }
 
-function api_updateTerritory(token, id, number, name) {
+// lendable：借りる・返すを使うか（図面・画像とリンクのみ）。url：リンクのURL（リンクのみ）
+function api_updateTerritory(token, id, number, name, lendable, url) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
   number = cleanTerrNumber_(number);
   name = cleanTerrName_(name);
   const all = liveTerritories_();
   const t = all.find(function (r) { return r.id === id; });
-  if (!t) throw new Error('区域カードが見つかりません。');
-  if (all.some(function (r) { return isLendable_(r) === isLendable_(t) && String(r.number) === number && r.id !== id; })) {
-    throw new Error((isLendable_(t) ? '区域' : 'リスト') + number + 'はすでに登録されています。');
+  if (!t) throw new Error('共有カードが見つかりません。');
+  if (all.some(function (r) { return String(r.number) === number && r.id !== id; })) {
+    throw new Error('No.' + number + 'はすでに登録されています。');
   }
+  if (t.type !== 'list' && lendable !== undefined && lendable !== null) {
+    const v = lendable ? '1' : '0';
+    if (v === '0' && (t.holderId || t.holderName)) throw new Error('貸し出し中のカードは、借りる・返すをオフにできません。先に返却してください。');
+    t.lendable = v;
+  }
+  if (t.type === 'link' && url !== undefined && url !== null) t.linkUrl = cleanLinkUrl_(url);
   t.number = String(number);
   t.name = name;
   t.updatedAt = nowIso_();
-  updateRow_('Territories', t._row, t);
+  updateRow_('Cards', t._row, t);
   return true;
 }
 
@@ -2071,11 +2114,11 @@ function api_deleteTerritory(token, id) {
   const u = requireUser_(token);
   requireTerrAdmin_(u);
   const t = liveTerritories_().find(function (r) { return r.id === id; });
-  if (!t) throw new Error('区域カードが見つかりません。');
+  if (!t) throw new Error('共有カードが見つかりません。');
   if (isLendable_(t) && (t.holderId || t.holderName)) throw new Error('貸し出し中のカードは削除できません。先に返却してください。');
   t.deleted = '1';
   t.updatedAt = nowIso_();
-  updateRow_('Territories', t._row, t);
+  updateRow_('Cards', t._row, t);
   if (t.fileId) {
     const f = readRows_('Files').find(function (r) { return r.id === t.fileId; });
     if (f) trashFile_(f);
@@ -2083,14 +2126,14 @@ function api_deleteTerritory(token, id) {
   return true;
 }
 
-// ===== 区域カード：書き込み・コメント =====
+// ===== 共有カード：書き込み・コメント =====
 // 書き込みの保存。各書き込みには書いた人のID（a）を付け、
-// 区域カード管理者でない人は、自分以外が書いたものを消せない
+// 共有カード管理者でない人は、自分以外が書いたものを消せない
 function api_saveInk(token, id, data) {
   const u = requireUser_(token);
   const t = findTerritoryFor_(u, id);
   const admin = isTerrAdmin_(u);
-  if (t.holderId !== u.id && !admin) throw new Error('地図に書き込めるのは、借りている人と区域カード管理者だけです。');
+  if (t.holderId !== u.id && !admin) throw new Error('画像に書き込めるのは、借りている人と共有カード管理者だけです。');
   data = String(data || '');
   let items = [];
   if (data) {
@@ -2102,7 +2145,7 @@ function api_saveInk(token, id, data) {
   const lock = LockService.getScriptLock();
   lock.waitLock(15000);
   try {
-    const row = readRows_('TerritoryInk').find(function (r) { return r.territoryId === t.id; });
+    const row = readRows_('CardInk').find(function (r) { return r.territoryId === t.id; });
     let oldItems = [];
     try { oldItems = row && row.data ? (JSON.parse(row.data).items || []) : []; } catch (e) { oldItems = []; }
     const oldKeys = {};
@@ -2111,7 +2154,7 @@ function api_saveInk(token, id, data) {
     items.forEach(function (it) { newKeys[JSON.stringify(it)] = true; });
     if (!admin) {
       const removedOthers = oldItems.some(function (it) { return it.a !== u.id && !newKeys[JSON.stringify(it)]; });
-      if (removedOthers) throw new Error('ほかの人が書いたものは消せません。区域カード管理者に依頼してください。');
+      if (removedOthers) throw new Error('ほかの人が書いたものは消せません。共有カード管理者に依頼してください。');
     }
     // 新しく加わった書き込みは、保存した人が書いたものとして記録
     items = items.map(function (it) {
@@ -2122,10 +2165,10 @@ function api_saveInk(token, id, data) {
       return copy;
     });
     const out = items.length ? JSON.stringify({ v: 1, items: items }) : '';
-    if (out.length > MAX_INK_CHARS) throw new Error('書き込みが多すぎて保存できません。区域カード管理者に、古い書き込みの消去を依頼してください。');
+    if (out.length > MAX_INK_CHARS) throw new Error('書き込みが多すぎて保存できません。共有カード管理者に、古い書き込みの消去を依頼してください。');
     const rec = { territoryId: t.id, data: out, updatedAt: nowIso_(), updatedBy: u.id };
-    if (row) updateRow_('TerritoryInk', row._row, rec);
-    else appendRow_('TerritoryInk', rec);
+    if (row) updateRow_('CardInk', row._row, rec);
+    else appendRow_('CardInk', rec);
     return out;
   } finally {
     lock.releaseLock();
@@ -2134,7 +2177,7 @@ function api_saveInk(token, id, data) {
 
 function terrComments_(u, territoryId, names) {
   const admin = isTerrAdmin_(u);
-  return readRows_('TerritoryComments').filter(function (c) { return c.territoryId === territoryId && c.deleted !== '1'; })
+  return readRows_('CardComments').filter(function (c) { return c.territoryId === territoryId && c.deleted !== '1'; })
     .sort(function (a, b) {
       if (a.warn !== b.warn) return a.warn === '1' ? -1 : 1;   // 要注意を先に
       return a.createdAt < b.createdAt ? 1 : -1;               // 新しい順
@@ -2152,12 +2195,12 @@ function api_addTerritoryComment(token, id, body, warn) {
   const u = requireUser_(token);
   const t = findTerritoryFor_(u, id);
   if (isLendable_(t) && !isTerrAdmin_(u) && t.holderId !== u.id && !recentlyReturnedBy_(t, u)) {
-    throw new Error('コメントを書けるのは、借りている人（返却後3日以内を含む）と区域カード管理者だけです。');
+    throw new Error('コメントを書けるのは、借りている人（返却後3日以内を含む）と共有カード管理者だけです。');
   }
   body = String(body || '').trim();
   if (!body) throw new Error('コメントを入力してください。');
   if (body.length > 500) throw new Error('コメントは500文字以内にしてください。');
-  appendRow_('TerritoryComments', {
+  appendRow_('CardComments', {
     id: 'tc' + randomToken_().slice(0, 14), territoryId: t.id, authorId: u.id, body: body,
     warn: warn ? '1' : '0', createdAt: nowIso_(), deleted: ''
   });
@@ -2166,16 +2209,16 @@ function api_addTerritoryComment(token, id, body, warn) {
 
 function api_deleteTerritoryComment(token, commentId) {
   const u = requireUser_(token);
-  const c = readRows_('TerritoryComments').find(function (r) { return r.id === commentId && r.deleted !== '1'; });
+  const c = readRows_('CardComments').find(function (r) { return r.id === commentId && r.deleted !== '1'; });
   if (!c) throw new Error('コメントが見つかりません。');
   findTerritoryFor_(u, c.territoryId);
   if (c.authorId !== u.id && !isTerrAdmin_(u)) throw new Error('このコメントは削除できません。');
   c.deleted = '1';
-  updateRow_('TerritoryComments', c._row, c);
+  updateRow_('CardComments', c._row, c);
   return terrComments_(u, c.territoryId, userNames_());
 }
 
-// ===== 区域カード：リスト型（Googleスプレッドシート） =====
+// ===== 共有カード：リスト型（Googleスプレッドシート） =====
 // gid：読むシート（タブ）。指定がなければ登録したシート、それもなければ先頭のシート
 function listSheet_(t, gid) {
   const book = SpreadsheetApp.openById(t.sheetId);
@@ -2248,7 +2291,7 @@ function safeCell_(v) {
 
 function requireListCard_(u, id) {
   const t = findTerritoryFor_(u, id);
-  if (t.type !== 'list') throw new Error('この区域はリスト型ではありません。');
+  if (t.type !== 'list') throw new Error('このカードはリスト型ではありません。');
   return t;
 }
 
@@ -2259,7 +2302,7 @@ function api_listSheet(token, id, gid) {
   try {
     return readListSheet_(t, gid);
   } catch (e) {
-    throw new Error('スプレッドシートを読み込めませんでした。区域カード管理者に、URLと共有設定の確認を依頼してください。');
+    throw new Error('スプレッドシートを読み込めませんでした。共有カード管理者に、URLと共有設定の確認を依頼してください。');
   }
 }
 
@@ -2305,6 +2348,179 @@ function api_listAddRow(token, id, values, gid) {
   } finally {
     lock.releaseLock();
   }
+}
+
+// ===== 資料箱 =====
+// 棚（分類）ごとに、リンクやファイルを整理して置いておく。groupId のある棚は、そのグループのメンバーだけが見られる
+function canEditLibrary_(u) {
+  return u.role === 'admin' || u.libraryAdmin === '1';
+}
+function requireLibraryEditor_(u) {
+  if (!canEditLibrary_(u)) throw new Error('資料箱を整理できるのは、全体管理者と資料箱管理者だけです。');
+}
+
+function liveShelves_() {
+  return readRows_('LibShelves').filter(function (r) { return r.deleted !== '1'; })
+    .sort(function (a, b) { return (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) || (a.createdAt < b.createdAt ? -1 : 1); });
+}
+function canSeeShelf_(u, shelf, myGroups) {
+  return !shelf.groupId || !!myGroups[shelf.groupId];
+}
+function findLibItemFor_(u, itemId, myGroups) {
+  const it = readRows_('LibItems').find(function (r) { return r.id === itemId && r.deleted !== '1'; });
+  const shelf = it && liveShelves_().find(function (s) { return s.id === it.shelfId; });
+  if (!it || !shelf || !canSeeShelf_(u, shelf, myGroups || myGroups_(u))) throw new Error('資料が見つかりません。');
+  return it;
+}
+
+function api_library(token) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  const myGroups = myGroups_(u);
+  const shelves = liveShelves_().filter(function (s) { return canSeeShelf_(u, s, myGroups); });
+  const ok = {};
+  shelves.forEach(function (s) { ok[s.id] = true; });
+  const files = {};
+  readRows_('Files').forEach(function (f) { if (f.ownerType === 'library' && f.deleted !== '1') files[f.id] = fileView_(f); });
+  const items = readRows_('LibItems').filter(function (r) { return r.deleted !== '1' && ok[r.shelfId]; })
+    .map(function (r) {
+      return {
+        id: r.id, shelfId: r.shelfId, title: r.title, kind: r.kind, url: r.kind === 'link' ? r.url : '',
+        file: r.kind === 'file' ? (files[r.fileId] || null) : null,
+        note: r.note, pinned: r.pinned === '1', updatedAt: r.updatedAt
+      };
+    })
+    .sort(function (a, b) {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return a.title.localeCompare(b.title, 'ja');
+    });
+  return {
+    canEdit: canEditLibrary_(u),
+    shelves: shelves.map(function (s) {
+      return { id: s.id, name: s.name, groupId: s.groupId, groupName: s.groupId && myGroups[s.groupId] ? myGroups[s.groupId].group.name : '' };
+    }),
+    items: items,
+    groups: Object.keys(myGroups).map(function (gid) { return { id: gid, name: myGroups[gid].group.name }; })
+  };
+}
+
+function api_saveShelf(token, id, name, groupId) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  requireLibraryEditor_(u);
+  name = String(name || '').trim();
+  if (!name || name.length > 30) throw new Error('棚の名前は1〜30文字で入力してください。');
+  groupId = String(groupId || '');
+  if (groupId && !myGroups_(u)[groupId]) throw new Error('グループが見つかりません。自分が入っているグループだけ選べます。');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const all = liveShelves_();
+    if (id) {
+      const s = all.find(function (r) { return r.id === id; });
+      if (!s) throw new Error('棚が見つかりません。');
+      s.name = name;
+      s.groupId = groupId;
+      updateRow_('LibShelves', s._row, s);
+      return s.id;
+    }
+    const nid = 'sh' + randomToken_().slice(0, 14);
+    const max = all.reduce(function (m, r) { return Math.max(m, Number(r.sortOrder) || 0); }, 0);
+    appendRow_('LibShelves', { id: nid, name: name, groupId: groupId, sortOrder: String(max + 1), createdAt: nowIso_(), deleted: '' });
+    return nid;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// dir：-1 で上へ、1 で下へ
+function api_moveShelf(token, id, dir) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  requireLibraryEditor_(u);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const all = liveShelves_();
+    const i = all.findIndex(function (r) { return r.id === id; });
+    const j = i + (Number(dir) < 0 ? -1 : 1);
+    if (i < 0 || j < 0 || j >= all.length) return true;
+    const tmp = all[i]; all[i] = all[j]; all[j] = tmp;
+    all.forEach(function (r, k) {
+      if (String(r.sortOrder) !== String(k + 1)) { r.sortOrder = String(k + 1); updateRow_('LibShelves', r._row, r); }
+    });
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function api_deleteShelf(token, id) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  requireLibraryEditor_(u);
+  const s = liveShelves_().find(function (r) { return r.id === id; });
+  if (!s) throw new Error('棚が見つかりません。');
+  if (readRows_('LibItems').some(function (r) { return r.shelfId === id && r.deleted !== '1'; })) {
+    throw new Error('この棚には資料が入っています。先に資料を別の棚へ移すか、削除してください。');
+  }
+  s.deleted = '1';
+  updateRow_('LibShelves', s._row, s);
+  return true;
+}
+
+// data：{ id, shelfId, title, kind（link か file）, url, fileId, note, pinned }
+function api_saveLibItem(token, data) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  requireLibraryEditor_(u);
+  data = data || {};
+  const shelf = liveShelves_().find(function (s) { return s.id === data.shelfId; });
+  if (!shelf || !canSeeShelf_(u, shelf, myGroups_(u))) throw new Error('棚を選んでください。');
+  const title = String(data.title || '').trim();
+  if (!title || title.length > 60) throw new Error('資料の名前は1〜60文字で入力してください。');
+  const note = String(data.note || '').trim();
+  if (note.length > 200) throw new Error('説明は200文字以内にしてください。');
+  const kind = data.kind === 'file' ? 'file' : 'link';
+  const url = kind === 'link' ? cleanLinkUrl_(data.url) : '';
+  const fileId = kind === 'file' ? String(data.fileId || '') : '';
+  if (kind === 'file' && !fileId) throw new Error('ファイルを選んでください。');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const now = nowIso_();
+    let it;
+    if (data.id) {
+      it = readRows_('LibItems').find(function (r) { return r.id === data.id && r.deleted !== '1'; });
+      if (!it) throw new Error('資料が見つかりません。');
+    } else {
+      it = { id: 'li' + randomToken_().slice(0, 14), createdBy: u.id, createdAt: now, deleted: '' };
+    }
+    const oldFileId = it.fileId;
+    it.shelfId = shelf.id; it.title = title; it.kind = kind; it.url = url; it.note = note;
+    it.pinned = data.pinned ? '1' : '0'; it.fileId = fileId; it.updatedAt = now;
+    if (fileId && fileId !== oldFileId) attachFiles_(u, [fileId], 'library', it.id);
+    if (it._row) updateRow_('LibItems', it._row, it);
+    else appendRow_('LibItems', it);
+    // 差し替えた・リンクに変えたときは、前のファイルを片付ける
+    if (oldFileId && oldFileId !== fileId) deleteFilesFor_('library', it.id, fileId ? [fileId] : []);
+    return it.id;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function api_deleteLibItem(token, id) {
+  const u = requireUser_(token);
+  requireFeature_('library');
+  requireLibraryEditor_(u);
+  const it = readRows_('LibItems').find(function (r) { return r.id === id && r.deleted !== '1'; });
+  if (!it) throw new Error('資料が見つかりません。');
+  it.deleted = '1';
+  it.updatedAt = nowIso_();
+  updateRow_('LibItems', it._row, it);
+  deleteFilesFor_('library', it.id, []);
+  return true;
 }
 
 // ===== カレンダー =====
@@ -2738,6 +2954,7 @@ function publicUser_(u) {
     id: u.id, loginId: u.loginId, name: u.name, email: u.email,
     role: u.role, territoryAdmin: u.territoryAdmin === '1', calendarEditor: u.calendarEditor === '1',
     digest: u.digestOff !== '1',
+    libraryAdmin: u.libraryAdmin === '1',
     features: appFeatures_()
   };
 }
