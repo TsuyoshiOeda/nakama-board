@@ -1,0 +1,23 @@
+# clasp（GASをPCから操作するツール）の設定：スクリプトIDが入るため公開しない
+.clasp.json
+.clasprc.json
+
+# データの書き出しや控え（メンバー情報などを誤ってアップロードしないため）
+*.xlsx
+*.csv
+*.ods
+data/
+backup/
+
+# 秘密の値・メモ
+.env
+*.secret
+招待コード*.txt
+
+# OSやエディタが作るファイル
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+node_modules/
