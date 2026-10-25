@@ -1579,7 +1579,7 @@
       '<button type="button" class="full-btn" data-action="mapFull" aria-label="全画面表示">' + (mapView.full ? '閉じる' : '全画面') + '</button>' +
       '<span class="ink-status muted small" id="ink-status">' + esc(ink.status) + '</span></div>';
     var note = c.canInk
-      ? '<div class="muted small">2本指で拡大・縮小・移動できます。ペンなどを選んでいるときは、1本指で書き込みます。書き込みは自動で保存され、次に借りる人に引き継がれます。消しゴムで触れた線や印が消えます' +
+      ? '<div class="muted small">2本指で拡大・縮小・移動できます。ペンなどを選んでいるときは、1本指で書き込みます。書き込みは自動で保存され、' + (isLend(c) ? '次に借りる人に引き継がれます。' : 'メンバー全員に表示されます。') + '消しゴムで触れた線や印が消えます' +
         (c.isAdmin ? '（共有カード管理者はすべて消せます）。' : '（消せるのは自分が書いたものだけです）。') + '</div>'
       : '<div class="muted small">2本指で拡大・縮小・移動できます。書き込めるのは、' + (isLend(c) ? '借りている人と' : '') + '共有カード管理者だけです。</div>';
     var clear = c.isAdmin ? '<button class="linkbtn danger-text" data-action="inkClear">書き込みを全消去（共有カード管理者）</button>' : '';
