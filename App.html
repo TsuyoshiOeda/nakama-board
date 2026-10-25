@@ -1,0 +1,3691 @@
+<script>
+(function () {
+  'use strict';
+
+  var APP_NAME = document.body.getAttribute('data-app-name') || 'なかまボード';
+  var ICON_URL = document.body.getAttribute('data-icon-url') || '';
+  var $app = document.getElementById('app');
+  var $overlay = document.getElementById('overlay');
+  var $toast = document.getElementById('toast');
+
+  var state = {
+    token: null,
+    user: null,
+    screen: 'loading',
+    // 管理
+    adminTab: 'members',
+    members: [],
+    invites: [],
+    lastInvite: null,
+    tempPw: null,
+    // 掲示板
+    summary: { unread: { board: 0, notice: 0 }, notices: [], upcoming: [] },
+    boardTab: 'board',
+    posts: null,
+    current: null,      // { post, comments }
+    compose: null,      // { mode: 'new'|'edit', type, post, files }
+    commentFiles: [],   // コメントに添付するファイル
+    // カレンダー
+    cal: null,          // { y, m, sel, events, canEdit }
+    eventView: null,    // 表示中の予定（1回分）
+    eventForm: null,    // { mode, ev, date, groupId }
+    eventBack: null,    // 予定の詳細から戻る先
+    // グループ・メッセージ
+    groups: null,       // 自分のグループ一覧
+    group: null,        // 表示中のグループ { group, members }
+    groupTab: 'board',
+    groupPosts: null,
+    groupEvents: null,
+    groupForm: null,    // { mode: 'new'|'edit', selected: {} }
+    users: null,        // メンバー一覧（選択用）
+    picker: null,       // { mode: 'dm'|'addMembers', title, back }
+    inbox: null,
+    chat: null,         // { convId, data, files, sending }
+    chatBack: null,
+    // 区域カード
+    terr: null,         // { isAdmin, dueDays, cards }
+    terrCard: null,     // 表示中のカードの詳細
+    terrTab: 'map',
+    terrFilter: '',
+    terrAdmin: null,    // 管理画面の選択状態 { selected: {} }
+    terrBack: 'territory'
+  };
+  var eventIndex = {};  // "id|date" → 予定（1回分）
+
+  var MAX_FILES = 5;
+  var MAX_PDF_BYTES = 5 * 1024 * 1024;
+  var fileMeta = {};    // id → { id, name, mime, size }
+  var fileCache = {};   // id → Promise<{ url, name, mime }>
+
+  // ---------- 保存（ブラウザ） ----------
+  var store = {
+    get: function () { try { return localStorage.getItem('ga_token'); } catch (e) { return null; } },
+    set: function (v) { try { localStorage.setItem('ga_token', v); } catch (e) {} },
+    clear: function () { try { localStorage.removeItem('ga_token'); } catch (e) {} }
+  };
+
+  // 前回の表示内容（この端末だけに保存。ログアウトで消去）
+  var cache = (function () {
+    var KEY = 'ga_cache';
+    var data = {};
+    try { data = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { data = {}; }
+    var timer = null;
+    function save() {
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        try { localStorage.setItem(KEY, JSON.stringify(data)); } catch (e) {
+          // 容量不足などの場合は保存をあきらめる（表示には影響しない）
+          try { localStorage.removeItem(KEY); } catch (e2) {}
+        }
+      }, 300);
+    }
+    return {
+      get: function (k) { return data.hasOwnProperty(k) ? data[k] : null; },
+      set: function (k, v) {
+        // カレンダーは直近の数か月分だけ残す
+        if (k.indexOf('cal:') === 0) {
+          var keys = Object.keys(data).filter(function (x) { return x.indexOf('cal:') === 0 && x !== k; });
+          while (keys.length >= 4) delete data[keys.shift()];
+        }
+        data[k] = v;
+        save();
+      },
+      clear: function () {
+        data = {};
+        clearTimeout(timer);
+        try { localStorage.removeItem(KEY); } catch (e) {}
+      }
+    };
+  })();
+
+  // 入力欄の内容を残したまま再描画する
+  function renderKeepingInput(id) {
+    var el = document.getElementById(id);
+    var value = el ? el.value : '';
+    var focused = el && document.activeElement === el;
+    render();
+    var el2 = document.getElementById(id);
+    if (el2 && value) el2.value = value;
+    if (el2 && focused) el2.focus();
+  }
+
+  // ---------- サーバー呼び出し ----------
+  function call(fn) {
+    var args = Array.prototype.slice.call(arguments, 1);
+    return new Promise(function (resolve, reject) {
+      var runner = google.script.run.withSuccessHandler(resolve).withFailureHandler(reject);
+      runner[fn].apply(runner, args);
+    });
+  }
+
+  function run() {
+    var args = arguments;
+    setBusy(true);
+    return call.apply(null, args).then(function (r) {
+      setBusy(false);
+      return r;
+    }, function (e) {
+      setBusy(false);
+      handleError(e);
+      throw e;
+    });
+  }
+
+  function errorText(e) {
+    var m = (e && e.message) ? e.message : String(e);
+    return m.replace(/^(Exception|Error):\s*/, '');
+  }
+
+  function handleError(e) {
+    var m = errorText(e);
+    if (m.indexOf('AUTH') >= 0) {
+      store.clear();
+      cache.clear();
+      state.token = null;
+      state.user = null;
+      go('login');
+      toast('もう一度ログインしてください。', true);
+      return;
+    }
+    toast(m, true);
+  }
+
+  // ---------- 表示の補助 ----------
+  function esc(s) {
+    return String(s === undefined || s === null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // 本文：エスケープした上でURLだけリンクにする
+  function richText(s) {
+    return esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + d.getHours() + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+
+  function fmtDay(iso) {
+    if (!iso) return '—';
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return '—';
+    return d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  function setBusy(b) { $overlay.hidden = !b; }
+
+  var toastTimer = null;
+  function toast(msg, isError) {
+    $toast.textContent = msg;
+    $toast.className = 'toast' + (isError ? ' error' : '');
+    $toast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { $toast.hidden = true; }, isError ? 5000 : 3500);
+  }
+
+  var ICONS = {
+    home: '<path d="M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z"></path>',
+    board: '<rect x="4" y="4" width="16" height="16" rx="2"></rect><path d="M8 9h8M8 13h8M8 17h5"></path>',
+    user: '<circle cx="12" cy="8" r="4"></circle><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"></path>',
+    gear: '<circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1 7 17M17 7l2.1-2.1"></path>',
+    group: '<circle cx="9" cy="8" r="3"></circle><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"></path><circle cx="17" cy="9" r="2.5"></circle><path d="M16 14.2c2.9.4 5 2.8 5 5.8"></path>',
+    back: '<path d="M15 5l-7 7 7 7"></path>',
+    next: '<path d="M9 5l7 7-7 7"></path>',
+    cal: '<rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 3v4M16 3v4"></path>',
+    pin: '<path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"></path><circle cx="12" cy="9.5" r="2.5"></circle>',
+    chat: '<path d="M4 5h16v11H9l-5 4z"></path>',
+    menu: '<path d="M4 6h16M4 12h16M4 18h16"></path>',
+    map: '<path d="M9 4 3 6v14l6-2 6 2 6-2V4l-6 2z"></path><path d="M9 4v14M15 6v14"></path>',
+    hand: '<path d="M8 13V5.5a1.5 1.5 0 0 1 3 0V12"></path><path d="M11 11.5v-2a1.5 1.5 0 0 1 3 0V12"></path><path d="M14 10.5a1.5 1.5 0 0 1 3 0V12"></path><path d="M17 11.5a1.5 1.5 0 0 1 3 0V16a6 6 0 0 1-6 6h-1.5a6 6 0 0 1-4.6-2.2L4.6 16a1.5 1.5 0 0 1 2.3-1.9L8 15.5"></path>',
+    pen: '<path d="M4 20l4-1 11-11-3-3L5 16z"></path><path d="M14 6l3 3"></path>',
+    undo: '<path d="M9 14 4 9l5-5"></path><path d="M4 9h11a5 5 0 0 1 0 10h-3"></path>',
+    warn: '<path d="M12 3 2 20h20z"></path><path d="M12 10v4M12 17h.01"></path>',
+    eraser: '<path d="M16 3.5 20.5 8a1.5 1.5 0 0 1 0 2.1L11 19.6H6.5L3.5 16.6a1.5 1.5 0 0 1 0-2.1L13.9 3.5a1.5 1.5 0 0 1 2.1 0z"></path><path d="M9 9l6.5 6.5"></path><path d="M11 19.6h9"></path>',
+    open: '<path d="M14 4h6v6"></path><path d="M20 4l-9 9"></path><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"></path>',
+    history: '<path d="M3 12a9 9 0 1 0 3-6.7L3 8"></path><path d="M3 3v5h5"></path><path d="M12 7v5l3 3"></path>',
+    send: '<path d="M4 12 20 4l-6 16-3-7z"></path>',
+    clip: '<path d="M21 11.5 12.5 20a5 5 0 0 1-7-7L14 4.5a3.3 3.3 0 0 1 4.7 4.7L10.2 17.7a1.7 1.7 0 0 1-2.4-2.4L15.5 7.6"></path>',
+    repeat: '<path d="M17 2l3 3-3 3"></path><path d="M4 11V9a4 4 0 0 1 4-4h12"></path><path d="M7 22l-3-3 3-3"></path><path d="M20 13v2a4 4 0 0 1-4 4H4"></path>',
+    plus: '<path d="M12 5v14M5 12h14"></path>'
+  };
+  function icon(name, size) {
+    size = size || 22;
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ICONS[name] + '</svg>';
+  }
+
+  function isAdmin() { return state.user && state.user.role === 'admin'; }
+  function totalUnread() { var u = state.summary.unread; return (u.board || 0) + (u.notice || 0) + (u.group || 0); }
+
+  // ---------- 画面切り替え ----------
+  function go(screen) {
+    // 地図の書き込みが保存待ちなら、画面を移る前に保存する
+    if (ink.dirty) { clearTimeout(ink.saveTimer); saveInk(); }
+    // オフになっている機能の画面には入らない
+    var needs = { board: 'board', post: 'board', compose: 'board', calendar: 'calendar', event: 'calendar', eventForm: 'calendar',
+      inbox: 'chat', chat: 'chat', groups: 'groups', group: 'groups', groupForm: 'groups' };
+    var need = needs[screen] || (/^terr/.test(screen) || screen === 'territory' ? 'cards' : '');
+    if (need && !featOn(need)) screen = 'home';
+    state.screen = screen;
+    render();
+    window.scrollTo(0, 0);
+    if (screen === 'admin') loadAdmin();
+    if (screen === 'home') loadSummary();
+    if (screen === 'board') loadPosts();
+    if (screen === 'calendar') loadCalendar();
+    if (screen === 'inbox') loadInbox();
+    if (screen === 'groups') loadGroups();
+    if (screen === 'group') loadGroup();
+    if (screen === 'territory') loadTerritories();
+    if (screen === 'terrAdmin') loadTerritories();
+  }
+
+  function render() {
+    var html;
+    switch (state.screen) {
+      case 'login': html = viewLogin(); break;
+      case 'register': html = viewRegister(); break;
+      case 'home': html = shell('ホーム', viewHome(), 'home'); break;
+      case 'board': html = shell('掲示板', viewBoard(), 'board', { right: boardRight() }); break;
+      case 'post': html = shell(postTitle(), viewPost(), postNav(), { back: postBackTarget() }); break;
+      case 'compose': html = shell(composeTitle(), viewCompose(), postNav(), { back: state.compose && state.compose.mode === 'edit' ? 'postBack' : postBackTarget() }); break;
+      case 'calendar': html = shell('予定', viewCalendar(), 'calendar', { right: calTargets().length ? '<button class="pill" data-action="newEvent">' + icon('plus', 16) + '追加</button>' : '' }); break;
+      case 'event': html = shell('予定', viewEvent(), 'calendar', { back: state.eventBack || 'calendar' }); break;
+      case 'eventForm': html = shell(eventFormTitle(), viewEventForm(), 'calendar', { back: eventFormBack() }); break;
+      case 'inbox': html = shell('メッセージ', viewInbox(), 'inbox', { right: '<button class="pill" data-action="newDm">' + icon('plus', 16) + '新規</button>' }); break;
+      case 'chat': html = shell(state.chat && state.chat.data ? state.chat.data.conv.title : 'トーク', viewChat(), 'inbox', { back: state.chatBack || 'inbox', noNav: true }); break;
+      case 'pickUsers': html = shell(state.picker ? state.picker.title : '', viewPicker(), state.picker && state.picker.mode === 'dm' ? 'inbox' : 'menu', { back: state.picker ? state.picker.back : 'menu' }); break;
+      case 'menu': html = shell('メニュー', viewMenu(), 'menu'); break;
+      case 'groups': html = shell('グループ', viewGroups(), 'menu', { back: 'menu', right: '<button class="pill" data-action="newGroup">' + icon('plus', 16) + '作成</button>' }); break;
+      case 'group': html = shell(state.group ? state.group.group.name : 'グループ', viewGroup(), 'menu', { back: 'groups' }); break;
+      case 'groupForm': html = shell(state.groupForm && state.groupForm.mode === 'edit' ? 'グループの設定' : 'グループを作成', viewGroupForm(), 'menu', { back: state.groupForm && state.groupForm.mode === 'edit' ? 'group' : 'groups' }); break;
+      case 'territory': html = shell('区域カード', viewTerritory(), 'territory', { right: state.terr && state.terr.isAdmin ? '<button class="pill" data-go="terrAdmin">' + icon('gear', 16) + '管理</button>' : '' }); break;
+      case 'terrCard': html = shell(state.terrCard ? terrTitle(state.terrCard) : '区域カード', viewTerrCard(), 'territory', { back: state.terrBack || 'territory' }); break;
+      case 'terrAdmin': html = shell('区域カードの管理', viewTerrAdmin(), 'territory', { back: 'territory' }); break;
+      case 'terrLend': html = shell('代理で貸し出す', viewTerrLend(), 'territory', { back: 'terrCard' }); break;
+      case 'terrHistory': html = shell('使用履歴', viewTerrHistory(), 'territory', { back: 'terrCard' }); break;
+      case 'terrEdit': html = shell(state.terrEdit && state.terrEdit.card ? (isList(state.terrEdit.card) ? 'リストを編集' : '区域カードを編集') : 'リストを登録', viewTerrEdit(), 'territory', { back: state.terrEdit && state.terrEdit.card ? 'terrCard' : 'terrAdmin' }); break;
+      case 'account': html = shell('アカウント', viewAccount(), 'menu', { back: 'menu' }); break;
+      case 'admin': html = shell('全体の管理', viewAdmin(), 'menu', { back: 'menu' }); break;
+      default: html = '<div class="loading"><div class="spinner"></div><div>読み込み中…</div></div>';
+    }
+    $app.innerHTML = html;
+    hydrateImages();
+    if (state.screen === 'terrCard') mountMap();
+    else document.body.classList.remove('map-full-open');
+  }
+
+  // アプリ全体の機能のオン・オフ（全体管理者が「アプリ設定」で決める）
+  var FEATURE_NAMES = { board: '掲示板', calendar: '予定（カレンダー）', chat: 'メッセージ', groups: 'グループ', cards: '共有カード' };
+  function featOn(f) {
+    var fs = state.user && state.user.features;
+    return !fs || fs[f] !== false;
+  }
+
+  function shell(title, body, active, opts) {
+    opts = opts || {};
+    var items = [['home', 'home', 'ホーム'], ['board', 'board', '掲示板', 'board'], ['inbox', 'chat', 'メッセージ', 'chat'], ['calendar', 'cal', '予定', 'calendar'], ['territory', 'map', '区域', 'cards'], ['menu', 'menu', 'メニュー']]
+      .filter(function (it) { return !it[3] || featOn(it[3]); });
+    var ts = state.summary.territory;
+    var counts = { board: totalUnread(), inbox: state.summary.chatUnread || 0, territory: ts && ts.alerts ? ts.alerts.length : 0 };
+    var nav = items.map(function (it) {
+      var n = counts[it[0]] || 0;
+      var badge = n > 0 ? '<span class="badge">' + (n > 99 ? '99+' : n) + '</span>' : '';
+      return '<button data-go="' + it[0] + '" class="' + (active === it[0] ? 'on' : '') + '">' + icon(it[1]) + '<span>' + it[2] + '</span>' + badge + '</button>';
+    }).join('');
+    var back = opts.back
+      ? (opts.back === 'postBack'
+        ? '<button class="iconbtn" data-action="backToPost" aria-label="戻る">' + icon('back') + '</button>'
+        : '<button class="iconbtn" data-go="' + opts.back + '" aria-label="戻る">' + icon('back') + '</button>')
+      : '';
+    return '<header class="topbar"><div class="left">' + back + '<h1>' + esc(title) + '</h1></div>' + (opts.right || '') + '</header>' +
+      '<main class="main' + (opts.noNav ? ' no-nav' : '') + '">' + body + '</main>' +
+      (opts.noNav ? '' : '<nav class="nav"><div class="nav-inner">' + nav + '</div></nav>');
+  }
+
+  // ---------- ログイン ----------
+  function viewLogin() {
+    return '<div class="auth">' +
+      '<div class="brand">' + (ICON_URL ? '<img class="logo logo-img" src="' + esc(ICON_URL) + '" alt="">' : '<div class="logo">' + icon('group', 32) + '</div>') +
+      '<h1>' + esc(APP_NAME) + '</h1><div class="muted small">招待されたメンバーのみ利用できます</div></div>' +
+      '<form class="card stack" data-form="login" autocomplete="on">' +
+        '<div class="field"><label for="f-login">ログインID</label><input id="f-login" name="loginId" type="text" autocomplete="username" autocapitalize="none" required></div>' +
+        '<div class="field"><label for="f-pw">パスワード</label><input id="f-pw" name="password" type="password" autocomplete="current-password" required></div>' +
+        '<button class="btn primary block" type="submit">ログイン</button>' +
+        '<div class="muted small center">パスワードを忘れた場合は、全体管理者に再設定を依頼してください。</div>' +
+      '</form>' +
+      '<div class="stack center"><div class="muted small">はじめての方</div>' +
+      '<button class="btn outline block" data-go="register">招待コードで登録</button></div>' +
+    '</div>';
+  }
+
+  function viewRegister() {
+    return '<div class="auth">' +
+      '<div class="brand"><h1>メンバー登録</h1><div class="muted small">管理者から受け取った招待コードを入力してください</div></div>' +
+      '<form class="card stack" data-form="register" autocomplete="on">' +
+        '<div class="field"><label for="r-code">招待コード</label><input id="r-code" name="code" type="text" autocapitalize="characters" required></div>' +
+        '<div class="field"><label for="r-login">ログインID</label><input id="r-login" name="loginId" type="text" autocomplete="username" autocapitalize="none" required><div class="hint">半角英数字3〜30文字（記号は _ . - のみ）</div></div>' +
+        '<div class="field"><label for="r-name">表示名</label><input id="r-name" name="name" type="text" maxlength="30" required><div class="hint">他のメンバーに表示される名前です</div></div>' +
+        '<div class="field"><label for="r-pw">パスワード</label><input id="r-pw" name="password" type="password" autocomplete="new-password" required><div class="hint">8文字以上</div></div>' +
+        '<div class="field"><label for="r-pw2">パスワード（確認）</label><input id="r-pw2" name="password2" type="password" autocomplete="new-password" required></div>' +
+        '<div class="field"><label for="r-mail">メールアドレス（任意）</label><input id="r-mail" name="email" type="email" autocomplete="email"><div class="hint">お知らせや未読の通知に使います。Gmail以外も可</div></div>' +
+        '<button class="btn primary block" type="submit">登録する</button>' +
+      '</form>' +
+      '<button class="linkbtn" data-go="login">ログイン画面に戻る</button>' +
+    '</div>';
+  }
+
+  // ---------- ホーム ----------
+  function viewHome() {
+    var u = state.user;
+    var s = state.summary;
+    var badges = '';
+    if (u.role === 'admin') badges += ' <span class="tag admin">全体管理者</span>';
+    if (u.territoryAdmin) badges += ' <span class="tag terr">区域カード管理者</span>';
+    if (u.calendarEditor && u.role !== 'admin') badges += ' <span class="tag cal">カレンダー編集者</span>';
+
+    var notices = s.notices.length
+      ? s.notices.map(function (n) {
+          return '<button class="notice-row" data-action="openPost" data-id="' + esc(n.id) + '">' +
+            '<div class="post-meta">' + (n.important ? '<span class="tag imp">重要</span>' : '') + fmtDate(n.createdAt) + (n.isRead ? '' : '<span class="dot" aria-label="未読"></span>') + '</div>' +
+            '<div style="font-weight:500">' + esc(n.title) + '</div></button>';
+        }).join('')
+      : '<div class="muted small" style="padding:8px 0">お知らせはまだありません</div>';
+
+    var upcoming = (s.upcoming || []).length
+      ? s.upcoming.map(eventRow).join('')
+      : '<div class="muted small" style="padding:8px 0">7日以内の予定はありません</div>';
+
+    var ts = s.territory || { holding: 0, alerts: [] };
+    var soon = '<button class="tile link" data-go="territory"><div class="label">区域カード</div><div class="num">' + (ts.holding || 0) + '<span class="small muted" style="font-weight:400"> 枚を借りています</span></div></button>';
+    var terrAlerts = (ts.alerts || []).map(function (a) {
+      var msg = a.kind === 'return' ? '貸出対象外になりました。返却をお願いします'
+        : a.kind === 'overdue' ? '返却期限（' + fmtShortDay(a.dueDate) + '）を過ぎています'
+        : '返却期限（' + fmtShortDay(a.dueDate) + '）が近づいています';
+      return '<button class="notice terr-alert" data-action="openTerr" data-id="' + esc(a.id) + '">' + icon('warn', 18) +
+        '<span><b>区域 ' + a.number + (a.name ? ' ' + esc(a.name) : '') + '</b><br>' + msg + '</span></button>';
+    }).join('');
+
+    var admin = isAdmin()
+      ? '<button class="btn outline block" data-go="admin">' + icon('gear', 18) + 'メンバー管理・招待コード</button>'
+      : '';
+
+    var tiles = (featOn('board') ? '<button class="tile link" data-go="board"><div class="label">掲示板</div><div class="num">' + (s.unread.board || 0) + '<span class="small muted" style="font-weight:400"> 件の未読</span></div></button>' : '') +
+      (featOn('chat') ? '<button class="tile link" data-go="inbox"><div class="label">メッセージ</div><div class="num">' + (s.chatUnread || 0) + '<span class="small muted" style="font-weight:400"> 件の未読</span></div></button>' : '') +
+      (featOn('groups') ? '<button class="tile link" data-go="groups"><div class="label">グループ</div><div class="num">' + (s.groupCount || 0) + '<span class="small muted" style="font-weight:400"> 件に参加</span></div></button>' : '') +
+      (featOn('cards') ? soon : '');
+    return '<div class="muted">' + esc(u.name) + 'さん、こんにちは' + badges + '</div>' + (featOn('cards') ? terrAlerts : '') +
+      (featOn('board') ? '<div class="card"><div style="display:flex;justify-content:space-between;align-items:baseline">' +
+        '<div class="section-title">お知らせ</div><button class="linkbtn" data-action="toNotices">すべて見る</button></div>' +
+        notices + '</div>' : '') +
+      (featOn('calendar') ? '<div class="card"><div style="display:flex;justify-content:space-between;align-items:baseline">' +
+        '<div class="section-title">これからの予定（7日間）</div><button class="linkbtn" data-go="calendar">カレンダー</button></div>' +
+        upcoming + '</div>' : '') +
+      (tiles ? '<div class="tiles">' + tiles + '</div>' : '') + admin;
+  }
+
+  function loadSummary() {
+    if (!state.token) return Promise.resolve();
+    return call('api_homeSummary', state.token, todayStr()).then(function (s) {
+      state.summary = s;
+      cache.set('summary', s);
+      // 入力中の内容を消さないよう、ホームと一覧だけ再描画
+      if (state.screen === 'home' || state.screen === 'board') render();
+    }, handleError);
+  }
+
+  // ---------- 掲示板 ----------
+  function boardRight() {
+    if (state.boardTab === 'notice' && !isAdmin()) return '';
+    if (state.boardTab === 'groups' && !(state.boardGroups || []).length) return '';
+    return '<button class="pill" data-action="newPost">' + icon('plus', 16) + '投稿</button>';
+  }
+
+  function viewBoard() {
+    var u = state.summary.unread;
+    var tab = function (key, label, n) {
+      return '<button data-action="boardTab" data-tab="' + key + '" class="' + (state.boardTab === key ? 'on' : '') + '">' +
+        label + (n ? ' <span class="badge">' + n + '</span>' : '') + '</button>';
+    };
+    var html = '<div class="seg seg3">' + tab('board', '全体', u.board) + tab('notice', 'お知らせ', u.notice) + tab('groups', 'グループ', u.group) + '</div>';
+    if (state.posts === null) return html + '<div class="muted center">読み込み中…</div>';
+    if (!state.posts.length) {
+      var empty = state.boardTab === 'notice' ? 'お知らせはまだありません'
+        : state.boardTab === 'groups'
+          ? ((state.boardGroups || []).length ? 'グループの投稿はまだありません' : '掲示板を使っているグループに参加していません')
+          : 'まだ投稿がありません。右上の「投稿」から書き込めます';
+      return html + '<div class="empty">' + empty + '</div>';
+    }
+    return html + state.posts.map(postCard).join('');
+  }
+
+  function postCard(p) {
+    return '<button class="card post-card" data-action="openPost" data-id="' + esc(p.id) + '">' +
+      '<div class="post-meta">' + (p.important ? '<span class="tag imp">重要</span>' : '') +
+        (p.groupName && state.screen === 'board' ? '<span class="tag grp">' + esc(p.groupName) + '</span>' : '') +
+        '<span>' + esc(p.authorName) + '</span><span>' + fmtDate(p.createdAt) + '</span>' +
+        (p.isRead ? '' : '<span class="dot" aria-label="未読"></span>') + '</div>' +
+      '<div class="post-title">' + esc(p.title) + '</div>' +
+      '<div class="post-excerpt">' + esc(p.body) + '</div>' +
+      '<div class="post-foot"><span>コメント ' + p.commentCount + '</span><span>既読 ' + p.readCount + '人</span>' +
+        (p.files && p.files.length ? '<span>添付 ' + p.files.length + '</span>' : '') + '</div>' +
+    '</button>';
+  }
+
+  function loadPosts() {
+    var tab = state.boardTab;
+    // 前回の一覧があればすぐ表示し、裏で最新に更新する
+    state.posts = cache.get('posts:' + tab);
+    if (!state.boardGroups) state.boardGroups = cache.get('boardGroups');
+    render();
+    return call('api_listPosts', state.token, tab).then(function (res) {
+      if (state.boardTab !== tab) return;
+      state.posts = res.posts;
+      state.summary.unread = res.unread;
+      state.boardGroups = res.boardGroups || [];
+      cache.set('posts:' + tab, res.posts);
+      cache.set('boardGroups', state.boardGroups);
+      if (state.screen === 'board') render();
+    }, handleError);
+  }
+
+  function findPost(id) {
+    var list = (state.posts || []).concat(state.groupPosts || []);
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+  }
+
+  // 投稿の画面がグループのものかどうかで、見出し・戻る先を変える
+  function postGroupId() {
+    if (state.screen === 'compose' && state.compose) return state.compose.groupId || (state.compose.post && state.compose.post.groupId) || '';
+    return state.current && state.current.post ? (state.current.post.groupId || '') : '';
+  }
+  function postTitle() {
+    if (!state.current) return '投稿';
+    var p = state.current.post;
+    if (p.groupId) return p.groupName || (state.group && state.group.group.id === p.groupId ? state.group.group.name : 'グループの投稿');
+    return p.type === 'notice' ? 'お知らせ' : '掲示板';
+  }
+  // 掲示板タブから開いたか、グループ画面から開いたかで戻る先を決める
+  function postNav() { return postGroupId() && state.postFrom === 'group' ? 'menu' : 'board'; }
+  function postBackTarget() { return postGroupId() && state.postFrom === 'group' ? 'group' : 'board'; }
+
+  function openPost(id) {
+    // 一覧にある内容を先に表示し、コメントと既読は読み込み後に表示する
+    var known = findPost(id);
+    if (state.screen === 'group' || state.screen === 'board') state.postFrom = state.screen;
+    state.current = known ? { post: known, comments: null } : null;
+    state.commentFiles = [];
+    state.screen = 'post';
+    render();
+    window.scrollTo(0, 0);
+    return call('api_getPost', state.token, id).then(function (r) {
+      state.current = r;
+      state.summary.unread = r.unread;
+      if (state.screen === 'post') renderKeepingInput('cm-body');
+    }, function (e) {
+      handleError(e);
+      if (state.token) go(postBackTarget());
+    });
+  }
+
+  function viewPost() {
+    if (!state.current) return '<div class="muted center">読み込み中…</div>';
+    var p = state.current.post;
+    var actions = '';
+    if (p.canEdit) actions += '<button class="btn small outline" data-action="editPost">編集</button>';
+    if (p.canDelete) actions += '<button class="btn small danger" data-action="deletePost">削除</button>';
+
+    var loadingComments = state.current.comments === null;
+    var commentCount = loadingComments ? p.commentCount : state.current.comments.length;
+    var comments = (state.current.comments || []).map(function (c) {
+      return '<div class="comment"><div class="avatar">' + esc((c.authorName || '?').slice(0, 1)) + '</div>' +
+        '<div style="flex:1;min-width:0"><div class="post-meta"><span style="color:var(--text);font-weight:500">' + esc(c.authorName) + '</span><span>' + fmtDate(c.createdAt) + '</span></div>' +
+        (c.body ? '<div class="comment-body">' + richText(c.body) + '</div>' : '') +
+        filesView(c.files) + '</div>' +
+        (c.canDelete ? '<button class="linkbtn small" data-action="deleteComment" data-id="' + esc(c.id) + '" aria-label="コメントを削除">削除</button>' : '') +
+      '</div>';
+    }).join('');
+
+    return '<article class="card stack">' +
+        '<div class="post-meta">' + (p.important ? '<span class="tag imp">重要</span>' : '') +
+          '<span>' + esc(p.authorName) + '</span><span>' + fmtDate(p.createdAt) + (p.edited ? '（編集済み）' : '') + '</span></div>' +
+        '<h2 style="font-size:18px">' + esc(p.title) + '</h2>' +
+        '<div class="post-body">' + richText(p.body) + '</div>' +
+        filesView(p.files) +
+        '<div class="post-foot"><span>既読 ' + p.readCount + '人</span><span>コメント ' + commentCount + '</span></div>' +
+        (actions ? '<div class="actions">' + actions + '</div>' : '') +
+      '</article>' +
+      '<section class="card">' +
+        '<div class="section-title">コメント</div>' +
+        (loadingComments
+          ? '<div class="muted small" style="padding:8px 0">読み込み中…</div>'
+          : (comments || '<div class="muted small" style="padding:8px 0">まだコメントはありません</div>')) +
+        '<form class="stack" data-form="comment" style="padding-top:12px">' +
+          '<label for="cm-body" class="small" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)">コメント</label>' +
+          '<textarea id="cm-body" name="body" maxlength="1000" placeholder="コメントを書く"></textarea>' +
+          attachPicker('comment', state.commentFiles) +
+          '<button class="btn primary block" type="submit">コメントする</button>' +
+        '</form>' +
+      '</section>';
+  }
+
+  function composeTitle() {
+    if (!state.compose) return '投稿';
+    var kind = state.compose.pickGroup || state.compose.groupId || (state.compose.post && state.compose.post.groupId) ? 'グループ掲示板' : (state.compose.type === 'notice' ? 'お知らせ' : '掲示板');
+    return state.compose.mode === 'edit' ? kind + 'を編集' : kind + 'に投稿';
+  }
+
+  function viewCompose() {
+    var c = state.compose;
+    if (!c) return '';
+    var p = c.post || { title: '', body: '', important: false };
+    var notice = c.type === 'notice';
+    var opts = '';
+    if (notice) {
+      opts += '<label class="check"><input type="checkbox" name="important"' + (p.important ? ' checked' : '') + '>重要なお知らせにする</label>';
+      if (c.mode === 'new') {
+        opts += '<label class="check"><input type="checkbox" name="sendMail">メールでも送る</label>' +
+          '<div class="hint muted small">メールアドレスを登録しているメンバー全員に送ります。1日の送信数に上限があるため、大切なお知らせだけにしてください。</div>';
+      }
+    }
+    var target = '';
+    if (c.mode === 'new' && c.pickGroup) {
+      target = '<div class="field"><label for="ps-group">投稿先のグループ</label><select id="ps-group" name="group">' +
+        (state.boardGroups || []).map(function (g) { return '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>'; }).join('') +
+        '</select></div>';
+    }
+    return '<form class="card stack" data-form="post">' + target +
+      '<div class="field"><label for="ps-title">タイトル</label><input id="ps-title" name="title" type="text" maxlength="60" value="' + esc(p.title) + '" required></div>' +
+      '<div class="field"><label for="ps-body">本文</label><textarea id="ps-body" name="body" maxlength="3000" style="min-height:200px" required>' + esc(p.body) + '</textarea><div class="hint">3000文字まで。URLは自動でリンクになります</div></div>' +
+      '<div class="field"><label>添付ファイル</label>' + attachPicker('compose', c.files) + '</div>' +
+      opts +
+      '<button class="btn primary block" type="submit">' + (c.mode === 'edit' ? '保存する' : '投稿する') + '</button>' +
+    '</form>';
+  }
+
+  // ---------- カレンダー ----------
+  var WD = '日月火水木金土';
+  function pad(n) { return ('0' + n).slice(-2); }
+  function ymd(y, m, d) { return y + '-' + pad(m + 1) + '-' + pad(d); }   // m は0始まり
+  function dateToYmd(d) { return ymd(d.getFullYear(), d.getMonth(), d.getDate()); }
+  function todayStr() { return dateToYmd(new Date()); }
+  function parseYmd(s) { var p = String(s).split('-'); return new Date(+p[0], +p[1] - 1, +p[2]); }
+  function fmtYmdJa(s) { var d = parseYmd(s); return (d.getMonth() + 1) + '月' + d.getDate() + '日（' + WD[d.getDay()] + '）'; }
+  function timeText(e) { return e.allDay ? '終日' : e.startTime + (e.endTime ? '〜' + e.endTime : ''); }
+  function canEditCal() { return !!(state.user && (state.user.role === 'admin' || state.user.calendarEditor)); }
+  // 予定を追加できる先（全体／グループ）。サーバーから受け取った一覧を使う
+  function calTargets() {
+    var c = state.cal;
+    if (c && c.targets) return c.targets;
+    return cache.get('calTargets') || (canEditCal() ? [{ id: '', name: '全体' }] : []);
+  }
+  function eventFormBack() {
+    var f = state.eventForm;
+    if (!f) return 'calendar';
+    if (f.mode !== 'new') return 'event';
+    return f.fromGroup ? 'group' : 'calendar';
+  }
+
+  function monthLabels(dateStr) {
+    var d = parseYmd(dateStr);
+    var n = Math.ceil(d.getDate() / 7);
+    return {
+      date: '毎月' + d.getDate() + '日',
+      nth: '毎月 ' + (n >= 5 ? '最終' : '第' + n) + WD[d.getDay()] + '曜'
+    };
+  }
+
+  function ensureCal() {
+    if (!state.cal) {
+      var t = new Date();
+      state.cal = { y: t.getFullYear(), m: t.getMonth(), sel: todayStr(), events: null, canEdit: false };
+    }
+    return state.cal;
+  }
+
+  // 月表示（6週間＝42日）の最初と最後の日
+  function calRange() {
+    var c = ensureCal();
+    var first = new Date(c.y, c.m, 1);
+    var start = new Date(c.y, c.m, 1 - first.getDay());
+    var end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 41);
+    return [dateToYmd(start), dateToYmd(end)];
+  }
+
+  function loadCalendar() {
+    var r = calRange();
+    state.cal.events = cache.get('cal:' + r[0]);
+    render();
+    return call('api_listEvents', state.token, r[0], r[1]).then(function (res) {
+      if (calRange()[0] !== r[0]) return;   // 読み込み中に月が変わった
+      state.cal.events = res.events;
+      state.cal.canEdit = res.canEdit;
+      state.cal.targets = res.targets || [];
+      cache.set('calTargets', state.cal.targets);
+      cache.set('cal:' + r[0], res.events);
+      if (state.screen === 'calendar') render();
+    }, handleError);
+  }
+
+  function moveMonth(k) {
+    var c = ensureCal();
+    var d = new Date(c.y, c.m + k, 1);
+    c.y = d.getFullYear();
+    c.m = d.getMonth();
+    var sel = parseYmd(c.sel);
+    if (sel.getFullYear() !== c.y || sel.getMonth() !== c.m) c.sel = ymd(c.y, c.m, 1);
+    loadCalendar();
+  }
+
+  function eventRow(e) {
+    eventIndex[e.id + '|' + e.date] = e;
+    return '<button class="ev-row" data-action="openEvent" data-key="' + esc(e.id + '|' + e.date) + '">' +
+      '<span class="ev-bar"></span>' +
+      '<span class="ev-main">' +
+        '<span class="ev-time">' + (state.screen === 'home' ? fmtYmdJa(e.date) + ' ・ ' : '') + esc(timeText(e)) + '</span>' +
+        '<span class="ev-title">' + esc(e.title) + (e.repeat !== 'none' ? ' <span class="ev-rep" aria-label="繰り返し">' + icon('repeat', 13) + '</span>' : '') + '</span>' +
+        (e.groupName ? '<span class="ev-group">' + esc(e.groupName) + '</span>' : '') +
+        (e.location ? '<span class="ev-loc">' + icon('pin', 13) + esc(e.location) + '</span>' : '') +
+      '</span>' +
+    '</button>';
+  }
+
+  function viewCalendar() {
+    var c = ensureCal();
+    var r = calRange();
+    var start = parseYmd(r[0]);
+    var today = todayStr();
+    var byDate = {};
+    (c.events || []).forEach(function (e) { (byDate[e.date] = byDate[e.date] || []).push(e); });
+
+    var head = WD.split('').map(function (w, i) {
+      return '<span class="' + (i === 0 ? 'sun' : i === 6 ? 'sat' : '') + '">' + w + '</span>';
+    }).join('');
+
+    var cells = '';
+    for (var i = 0; i < 42; i++) {
+      var d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      var s = dateToYmd(d);
+      var cls = ['cal-day'];
+      if (d.getMonth() !== c.m) cls.push('out');
+      if (s === c.sel) cls.push('sel');
+      if (s === today) cls.push('today');
+      if (d.getDay() === 0) cls.push('sun');
+      if (d.getDay() === 6) cls.push('sat');
+      var n = (byDate[s] || []).length;
+      cells += '<button class="' + cls.join(' ') + '" data-action="calPick" data-date="' + s + '" aria-label="' + fmtYmdJa(s) + (n ? ' 予定' + n + '件' : '') + '">' +
+        '<span class="num">' + d.getDate() + '</span>' +
+        '<span class="dots">' + (n ? '<i></i>' : '') + (n > 1 ? '<i></i>' : '') + (n > 2 ? '<i></i>' : '') + '</span></button>';
+    }
+
+    var list;
+    if (c.events === null) list = '<div class="muted center small">読み込み中…</div>';
+    else if ((byDate[c.sel] || []).length) list = byDate[c.sel].map(eventRow).join('');
+    else list = '<div class="empty">予定はありません' + (calTargets().length ? '<div style="margin-top:10px"><button class="btn small outline" data-action="newEvent">この日に予定を追加</button></div>' : '') + '</div>';
+
+    return '<div class="card cal">' +
+        '<div class="cal-head">' +
+          '<button class="iconbtn" data-action="calMove" data-d="-1" aria-label="前の月">' + icon('back', 20) + '</button>' +
+          '<div class="cal-title">' + c.y + '年 ' + (c.m + 1) + '月</div>' +
+          '<button class="iconbtn" data-action="calMove" data-d="1" aria-label="次の月">' + icon('next', 20) + '</button>' +
+          '<button class="btn small outline cal-today" data-action="calToday">今日</button>' +
+        '</div>' +
+        '<div class="cal-week">' + head + '</div>' +
+        '<div class="cal-grid">' + cells + '</div>' +
+      '</div>' +
+      '<section class="stack" style="gap:10px">' +
+        '<div class="section-title">' + fmtYmdJa(c.sel) + 'の予定</div>' + list +
+      '</section>';
+  }
+
+  function viewEvent() {
+    var e = state.eventView;
+    if (!e) return '<div class="muted center">予定が見つかりません</div>';
+    var rows = '<div class="ev-detail-row">' + icon('cal', 18) + '<span>' + fmtYmdJa(e.date) + '　' + esc(timeText(e)) + '</span></div>';
+    if (e.repeatLabel) rows += '<div class="ev-detail-row">' + icon('repeat', 18) + '<span>' + esc(e.repeatLabel) + '</span></div>';
+    if (e.location) rows += '<div class="ev-detail-row">' + icon('pin', 18) + '<span>' + esc(e.location) + '</span></div>';
+    rows += '<div class="ev-detail-row">' + icon('group', 18) + '<span>' + (e.groupName ? esc(e.groupName) + 'の予定' : '全体の予定') + '</span></div>';
+    var actions = e.canEdit
+      ? '<div class="actions"><button class="btn small outline" data-action="editEvent">編集</button><button class="btn small danger" data-action="deleteEvent">削除</button></div>'
+      : '';
+    return '<article class="card stack">' +
+      '<h2 style="font-size:19px">' + esc(e.title) + '</h2>' +
+      '<div class="stack" style="gap:8px">' + rows + '</div>' +
+      (e.memo ? '<div class="post-body" style="padding-top:10px;border-top:1px solid var(--line-soft)">' + richText(e.memo) + '</div>' : '') +
+      actions +
+    '</article>';
+  }
+
+  function eventFormTitle() {
+    var f = state.eventForm;
+    if (!f) return '予定';
+    if (f.mode === 'new') return '予定を追加';
+    if (f.mode === 'single') return 'この日の予定を変更';
+    if (f.mode === 'future') return 'この日以降を変更';
+    return '予定を変更';
+  }
+
+  function viewEventForm() {
+    var f = state.eventForm;
+    if (!f) return '';
+    var e = f.ev || {};
+    var single = f.mode === 'single';
+    var date = f.mode === 'all' ? e.startDate : f.date;
+    var repeat = single ? 'none' : (e.repeat || 'none');
+    var allDay = !!e.allDay;
+    var wds = (e.weekdays && e.weekdays.length) ? e.weekdays : [parseYmd(date).getDay()];
+    var ml = monthLabels(date);
+
+    var note = '';
+    if (f.mode === 'single') note = '<div class="notice small">繰り返しのうち、' + fmtYmdJa(f.date) + 'の回だけを変更します。</div>';
+    if (f.mode === 'future') note = '<div class="notice small">' + fmtYmdJa(f.date) + '以降の回をすべて変更します。それより前の回はそのままです。</div>';
+    if (f.mode === 'all' && e.repeat !== 'none') note = '<div class="notice small">繰り返しのすべての回を変更します。</div>';
+
+    var opt = function (v, label) { return '<option value="' + v + '"' + (repeat === v ? ' selected' : '') + '>' + label + '</option>'; };
+    var repeatHtml = single ? '' :
+      '<div class="field"><label for="ev-repeat">繰り返し</label>' +
+        '<select id="ev-repeat" name="repeat" data-change="evRepeat">' +
+          opt('none', 'なし') + opt('daily', '毎日') + opt('weekly', '毎週') +
+          '<option value="monthly_date" id="ev-opt-md"' + (repeat === 'monthly_date' ? ' selected' : '') + '>' + ml.date + '</option>' +
+          '<option value="monthly_nth" id="ev-opt-mn"' + (repeat === 'monthly_nth' ? ' selected' : '') + '>' + ml.nth + '</option>' +
+        '</select></div>' +
+      '<div class="field" id="ev-weekly"' + (repeat === 'weekly' ? '' : ' hidden') + '><label>曜日</label><div class="wd-pick">' +
+        WD.split('').map(function (w, i) {
+          return '<label class="wd"><input type="checkbox" name="wd" value="' + i + '"' + (wds.indexOf(i) >= 0 ? ' checked' : '') + '><span>' + w + '</span></label>';
+        }).join('') + '</div></div>' +
+      '<div class="field" id="ev-until"' + (repeat === 'none' ? ' hidden' : '') + '><label for="ev-until-in">繰り返しの終了日（任意）</label>' +
+        '<input id="ev-until-in" name="until" type="date" value="' + esc(e.untilDate || '') + '"><div class="hint">空欄の場合はずっと繰り返します</div></div>';
+
+    // 追加先（新規のときだけ選べる。グループから開いた場合は固定）
+    var targetHtml = '';
+    if (f.mode === 'new' && !f.fromGroup) {
+      var targets = calTargets();
+      if (targets.length > 1) {
+        targetHtml = '<div class="field"><label for="ev-target">追加先</label><select id="ev-target" name="target">' +
+          targets.map(function (t) { return '<option value="' + esc(t.id) + '">' + esc(t.name) + '</option>'; }).join('') + '</select></div>';
+      } else if (targets.length === 1) {
+        targetHtml = '<input type="hidden" name="target" value="' + esc(targets[0].id) + '">' +
+          '<div class="muted small">追加先：' + esc(targets[0].name) + '</div>';
+      }
+    } else if (f.mode === 'new' && f.fromGroup && state.group) {
+      targetHtml = '<div class="muted small">追加先：' + esc(state.group.group.name) + '</div>';
+    }
+
+    return note + '<form class="card stack" data-form="event">' + targetHtml +
+      '<div class="field"><label for="ev-title">タイトル</label><input id="ev-title" name="title" type="text" maxlength="60" value="' + esc(e.title || '') + '" required></div>' +
+      '<div class="field"><label for="ev-date">' + (repeat !== 'none' || f.mode === 'new' ? '日付（繰り返しの場合は開始日）' : '日付') + '</label>' +
+        '<input id="ev-date" name="date" type="date" value="' + esc(date) + '" data-change="evDate" required></div>' +
+      '<label class="check"><input type="checkbox" name="allDay" data-change="evAllDay"' + (allDay ? ' checked' : '') + '>終日</label>' +
+      '<div class="time-row" id="ev-times"' + (allDay ? ' hidden' : '') + '>' +
+        '<div class="field"><label for="ev-st">開始</label><input id="ev-st" name="startTime" type="time" value="' + esc(e.startTime || '10:00') + '"></div>' +
+        '<span class="muted">〜</span>' +
+        '<div class="field"><label for="ev-et">終了（任意）</label><input id="ev-et" name="endTime" type="time" value="' + esc(e.endTime || '') + '"></div>' +
+      '</div>' +
+      '<div class="field"><label for="ev-loc">場所（任意）</label><input id="ev-loc" name="location" type="text" maxlength="60" value="' + esc(e.location || '') + '"></div>' +
+      '<div class="field"><label for="ev-memo">メモ（任意）</label><textarea id="ev-memo" name="memo" maxlength="1000">' + esc(e.memo || '') + '</textarea></div>' +
+      repeatHtml +
+      '<button class="btn primary block" type="submit">保存する</button>' +
+    '</form>';
+  }
+
+  function openEventForm(mode, e, date, groupId) {
+    state.eventForm = { mode: mode, ev: e, date: date, groupId: groupId || '', fromGroup: !!groupId };
+    go('eventForm');
+  }
+
+  // ダイアログで選択肢を選ぶ（キャンセルは null）
+  var chooseResolve = null;
+  function choose(msg, opts) {
+    return new Promise(function (resolve) {
+      chooseResolve = resolve;
+      var d = document.getElementById('dlg');
+      if (!d) {
+        d = document.createElement('div');
+        d.id = 'dlg';
+        d.className = 'dialog';
+        document.body.appendChild(d);
+      }
+      d.innerHTML = '<div class="dialog-box" role="dialog" aria-modal="true" aria-label="' + esc(msg) + '">' +
+        '<div class="dialog-msg' + (msg.indexOf('・') >= 0 ? ' left' : '') + '">' + esc(msg) + '</div>' +
+        opts.map(function (o) {
+          return '<button class="btn ' + (o[2] || 'outline') + ' block" data-action="choose" data-key="' + o[0] + '">' + esc(o[1]) + '</button>';
+        }).join('') +
+        '<button class="linkbtn" data-action="choose" data-key="">キャンセル</button></div>';
+      d.hidden = false;
+    });
+  }
+  function closeChoose(key) {
+    var d = document.getElementById('dlg');
+    if (d) d.hidden = true;
+    var r = chooseResolve;
+    chooseResolve = null;
+    if (r) r(key || null);
+  }
+
+  var REPEAT_SCOPES = [['single', 'この日だけ'], ['future', 'この日以降すべて'], ['all', 'すべての回']];
+
+  // ---------- メニュー ----------
+  function viewMenu() {
+    var item = function (go, ic, label, sub) {
+      return '<button class="menu-item" data-go="' + go + '">' + icon(ic) +
+        '<span class="menu-text"><span class="menu-label">' + label + '</span>' + (sub ? '<span class="muted small">' + sub + '</span>' : '') + '</span>' +
+        icon('next', 18) + '</button>';
+    };
+    return '<div class="card menu-list">' +
+      (featOn('groups') ? item('groups', 'group', 'グループ', (state.summary.groupCount || 0) + 'グループに参加中') : '') +
+      item('account', 'user', 'アカウント', 'プロフィール・パスワード・ログアウト') +
+      (isAdmin() ? item('admin', 'gear', 'メンバー管理', '招待コード・権限・アプリの設定') : '') +
+    '</div>';
+  }
+
+  // ---------- グループ ----------
+  var FEATURE_LABELS = { board: '掲示板', calendar: 'カレンダー', chat: 'チャット' };
+  function hasFeature(g, f) { return featOn(f) && g && g.features && g.features.indexOf(f) >= 0; }
+
+  function loadGroups() {
+    state.groups = state.groups || cache.get('groups');
+    render();
+    return call('api_listGroups', state.token).then(function (list) {
+      state.groups = list;
+      cache.set('groups', list);
+      if (state.screen === 'groups') render();
+    }, handleError);
+  }
+
+  function viewGroups() {
+    if (!state.groups) return '<div class="muted center">読み込み中…</div>';
+    if (!state.groups.length) {
+      return '<div class="empty">まだグループに参加していません。<br>右上の「作成」から、LINEのグループのように作れます。</div>';
+    }
+    return state.groups.map(function (g) {
+      var unread = (g.boardUnread || 0) + (g.chatUnread || 0);
+      return '<button class="card group-row" data-action="openGroup" data-id="' + esc(g.id) + '">' +
+        '<span class="group-icon">' + esc(g.name.slice(0, 1)) + '</span>' +
+        '<span class="group-main"><span class="group-name">' + esc(g.name) + (g.isLeader ? ' <span class="tag admin">責任者</span>' : '') + '</span>' +
+        '<span class="muted small">' + g.memberCount + '人 ・ ' + (g.features.map(function (f) { return FEATURE_LABELS[f]; }).join('・') || '機能なし') + '</span></span>' +
+        (unread ? '<span class="badge">' + unread + '</span>' : '') +
+      '</button>';
+    }).join('');
+  }
+
+  function openGroup(id) {
+    var known = (state.groups || []).filter(function (g) { return g.id === id; })[0];
+    state.group = known ? { group: known, members: null } : null;
+    state.groupPosts = null;
+    state.groupEvents = null;
+    state.groupTab = known && known.features.length ? known.features[0] : 'members';
+    state.groupId = id;
+    go('group');
+  }
+
+  function loadGroup() {
+    var id = state.groupId;
+    render();
+    return call('api_getGroup', state.token, id).then(function (r) {
+      if (state.groupId !== id) return;
+      var keepTab = state.group && state.group.members !== null;
+      // 未読数は一覧から引き継ぐ
+      var known = (state.groups || []).filter(function (g) { return g.id === id; })[0];
+      r.group.boardUnread = known ? known.boardUnread : 0;
+      r.group.chatUnread = known ? known.chatUnread : 0;
+      state.group = r;
+      if (!keepTab && r.group.features.indexOf(state.groupTab) < 0 && state.groupTab !== 'members') {
+        state.groupTab = r.group.features[0] || 'members';
+      }
+      if (state.screen === 'group') render();
+      loadGroupTab();
+    }, function (e) {
+      handleError(e);
+      if (state.token) go('groups');
+    });
+  }
+
+  function loadGroupTab() {
+    var g = state.group && state.group.group;
+    if (!g) return;
+    if (state.groupTab === 'board' && hasFeature(g, 'board')) {
+      call('api_listPosts', state.token, 'board', g.id).then(function (res) {
+        if (!state.group || state.group.group.id !== g.id) return;
+        state.groupPosts = res.posts;
+        if (state.screen === 'group') render();
+      }, handleError);
+    }
+    if (state.groupTab === 'calendar' && hasFeature(g, 'calendar')) {
+      var today = todayStr();
+      var end = dateToYmd(new Date(parseYmd(today).getTime() + 60 * 86400000));
+      call('api_listEvents', state.token, today, end, g.id).then(function (res) {
+        if (!state.group || state.group.group.id !== g.id) return;
+        state.groupEvents = res.events;
+        if (state.screen === 'group') render();
+      }, handleError);
+    }
+  }
+
+  function viewGroup() {
+    if (!state.group) return '<div class="muted center">読み込み中…</div>';
+    var g = state.group.group;
+    var tabs = g.features.map(function (f) { return [f, FEATURE_LABELS[f]]; }).concat([['members', 'メンバー']]);
+    var tabHtml = '<div class="tabs" role="tablist">' + tabs.map(function (t) {
+      var n = t[0] === 'board' ? (g.boardUnread || 0) : t[0] === 'chat' ? (g.chatUnread || 0) : 0;
+      return '<button role="tab" aria-selected="' + (state.groupTab === t[0]) + '" class="' + (state.groupTab === t[0] ? 'on' : '') + '" data-action="groupTab" data-tab="' + t[0] + '">' +
+        t[1] + (n ? ' <span class="badge">' + n + '</span>' : '') + '</button>';
+    }).join('') + '</div>';
+    var desc = g.description ? '<div class="muted small group-desc">' + esc(g.description) + '</div>' : '';
+    var body;
+    switch (state.groupTab) {
+      case 'board': body = viewGroupBoard(); break;
+      case 'calendar': body = viewGroupCalendar(); break;
+      case 'chat': body = viewGroupChat(); break;
+      default: body = viewGroupMembers();
+    }
+    return desc + tabHtml + body;
+  }
+
+  function viewGroupBoard() {
+    var head = '<div class="row-end"><button class="btn small primary" data-action="newGroupPost">' + icon('plus', 16) + '投稿</button></div>';
+    if (state.groupPosts === null) return head + '<div class="muted center small">読み込み中…</div>';
+    if (!state.groupPosts.length) return head + '<div class="empty">まだ投稿がありません</div>';
+    return head + state.groupPosts.map(postCard).join('');
+  }
+
+  function viewGroupCalendar() {
+    var head = '<div class="row-end"><button class="btn small primary" data-action="newGroupEvent">' + icon('plus', 16) + '予定を追加</button></div>';
+    if (state.groupEvents === null) return head + '<div class="muted center small">読み込み中…</div>';
+    if (!state.groupEvents.length) return head + '<div class="empty">これから60日間の予定はありません</div>';
+    return head + '<div class="card">' + state.groupEvents.map(function (e) {
+      eventIndex[e.id + '|' + e.date] = e;
+      return '<button class="ev-row" data-action="openEvent" data-key="' + esc(e.id + '|' + e.date) + '">' +
+        '<span class="ev-bar"></span><span class="ev-main">' +
+        '<span class="ev-time">' + fmtYmdJa(e.date) + ' ・ ' + esc(timeText(e)) + '</span>' +
+        '<span class="ev-title">' + esc(e.title) + '</span>' +
+        (e.location ? '<span class="ev-loc">' + icon('pin', 13) + esc(e.location) + '</span>' : '') +
+        '</span></button>';
+    }).join('') + '</div>';
+  }
+
+  function viewGroupChat() {
+    var g = state.group.group;
+    return '<div class="card stack center">' +
+      '<div>' + icon('chat', 32) + '</div>' +
+      '<div>グループのメンバー全員でやり取りできます</div>' +
+      '<button class="btn primary block" data-action="openChat" data-id="g_' + esc(g.id) + '">チャットを開く' +
+        (g.chatUnread ? '（未読 ' + g.chatUnread + '）' : '') + '</button></div>';
+  }
+
+  function viewGroupMembers() {
+    var g = state.group.group;
+    var members = state.group.members;
+    if (!members) return '<div class="muted center small">読み込み中…</div>';
+    var list = members.map(function (m) {
+      var ctrl = '';
+      if (g.isLeader && !m.isMe) {
+        ctrl = '<div class="member-actions">' +
+          (m.role === 'leader'
+            ? '<button class="btn small outline" data-action="setGroupRole" data-id="' + esc(m.id) + '" data-role="member">責任者から外す</button>'
+            : '<button class="btn small outline" data-action="setGroupRole" data-id="' + esc(m.id) + '" data-role="leader">責任者にする</button>') +
+          '<button class="btn small danger" data-action="removeGroupMember" data-id="' + esc(m.id) + '">外す</button></div>';
+      }
+      return '<div class="gm-row"><div class="avatar">' + esc((m.name || '?').slice(0, 1)) + '</div>' +
+        '<div class="gm-main"><div class="member-name">' + esc(m.name) + (m.isMe ? '（あなた）' : '') +
+        (m.role === 'leader' ? ' <span class="tag admin">責任者</span>' : '') + (m.active ? '' : ' <span class="tag off">利用停止中</span>') + '</div>' + ctrl + '</div></div>';
+    }).join('');
+    var leaderTools = g.isLeader
+      ? '<div class="actions"><button class="btn small primary" data-action="addGroupMembers">' + icon('plus', 16) + 'メンバーを追加</button>' +
+        '<button class="btn small outline" data-action="editGroup">' + icon('gear', 16) + 'グループの設定</button></div>'
+      : '';
+    return leaderTools + '<div class="card">' + list + '</div>' +
+      '<button class="btn danger block" data-action="leaveGroup">このグループから抜ける</button>' +
+      (g.isLeader ? '<button class="linkbtn danger-text" data-action="deleteGroup">グループを削除する</button>' : '');
+  }
+
+  function viewGroupForm() {
+    var f = state.groupForm;
+    if (!f) return '';
+    var g = f.group || { name: '', description: '', features: ['board', 'calendar', 'chat'] };
+    var feats = ['board', 'calendar', 'chat'].map(function (k) {
+      return '<label class="check"><input type="checkbox" name="feature" value="' + k + '"' + (g.features.indexOf(k) >= 0 ? ' checked' : '') + '>' + FEATURE_LABELS[k] + '</label>';
+    }).join('');
+    var members = '';
+    if (f.mode === 'new') {
+      members = '<div class="field"><label>メンバー（あとから追加もできます）</label>' + userChecklist(f.selected) + '</div>';
+    }
+    return '<form class="card stack" data-form="group">' +
+      '<div class="field"><label for="gf-name">グループ名</label><input id="gf-name" name="name" type="text" maxlength="30" value="' + esc(g.name) + '" required></div>' +
+      '<div class="field"><label for="gf-desc">説明（任意）</label><textarea id="gf-desc" name="description" maxlength="200">' + esc(g.description) + '</textarea></div>' +
+      '<div class="field"><label>使う機能</label>' + feats + '<div class="hint muted small">オフにした機能は、メンバーの画面に表示されません</div></div>' +
+      members +
+      '<button class="btn primary block" type="submit">' + (f.mode === 'new' ? '作成する' : '保存する') + '</button>' +
+    '</form>';
+  }
+
+  // メンバー選択（チェックボックス＋名前で絞り込み）
+  function userChecklist(selected, exclude) {
+    if (!state.users) return '<div class="muted small">読み込み中…</div>';
+    exclude = exclude || {};
+    var list = state.users.filter(function (u) { return !u.isMe && !exclude[u.id]; });
+    if (!list.length) return '<div class="muted small">追加できるメンバーがいません</div>';
+    return '<input type="text" class="user-filter" data-filter="users" placeholder="名前で絞り込み" aria-label="名前で絞り込み">' +
+      '<div class="user-list">' + list.map(function (u) {
+        return '<label class="check user-item" data-name="' + esc(u.name) + '"><input type="checkbox" name="member" value="' + esc(u.id) + '"' + (selected && selected[u.id] ? ' checked' : '') + '>' + esc(u.name) + '</label>';
+      }).join('') + '</div>';
+  }
+
+  function loadUsers() {
+    if (state.users) return Promise.resolve(state.users);
+    return call('api_listUsers', state.token).then(function (list) {
+      state.users = list;
+      if (state.screen === 'groupForm' || state.screen === 'pickUsers') render();
+      return list;
+    }, handleError);
+  }
+
+  // ---------- メンバー選択画面（1対1の相手／グループへの追加） ----------
+  function viewPicker() {
+    var p = state.picker;
+    if (!p) return '';
+    if (p.mode === 'dm') {
+      if (!state.users) return '<div class="muted center">読み込み中…</div>';
+      var list = state.users.filter(function (u) { return !u.isMe; });
+      return '<input type="text" class="user-filter" data-filter="users" placeholder="名前で絞り込み" aria-label="名前で絞り込み">' +
+        '<div class="card user-list">' + list.map(function (u) {
+          return '<button class="user-item user-pick" data-name="' + esc(u.name) + '" data-action="startDm" data-id="' + esc(u.id) + '">' +
+            '<span class="avatar">' + esc(u.name.slice(0, 1)) + '</span>' + esc(u.name) + '</button>';
+        }).join('') + '</div>';
+    }
+    var exclude = {};
+    (state.group && state.group.members || []).forEach(function (m) { exclude[m.id] = true; });
+    return '<form class="card stack" data-form="addMembers">' + userChecklist({}, exclude) +
+      '<button class="btn primary block" type="submit">追加する</button></form>';
+  }
+
+  // ---------- メッセージ ----------
+  function loadInbox() {
+    state.inbox = state.inbox || cache.get('inbox');
+    render();
+    return refreshInbox();
+  }
+  function refreshInbox() {
+    return call('api_inbox', state.token).then(function (list) {
+      state.inbox = list;
+      cache.set('inbox', list);
+      var total = 0;
+      list.forEach(function (c) { total += c.unread; });
+      state.summary.chatUnread = total;
+      if (state.screen === 'inbox') render();
+    }, handleError);
+  }
+
+  function fmtChatTime(iso) {
+    if (!iso) return '';
+    var d = new Date(iso);
+    var t = new Date();
+    if (d.toDateString() === t.toDateString()) return d.getHours() + ':' + pad(d.getMinutes());
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  function viewInbox() {
+    if (!state.inbox) return '<div class="muted center">読み込み中…</div>';
+    if (!state.inbox.length) {
+      return '<div class="empty">まだメッセージはありません。<br>右上の「新規」から、メンバーにメッセージを送れます。</div>';
+    }
+    return '<div class="card inbox">' + state.inbox.map(function (c) {
+      return '<button class="conv-row" data-action="openChat" data-id="' + esc(c.id) + '">' +
+        '<span class="avatar' + (c.type === 'group' ? ' group' : '') + '">' + (c.type === 'group' ? icon('group', 18) : esc(c.title.slice(0, 1))) + '</span>' +
+        '<span class="conv-main"><span class="conv-top"><span class="conv-title">' + esc(c.title) + '</span><span class="muted small">' + fmtChatTime(c.lastAt) + '</span></span>' +
+        '<span class="conv-last muted small">' + esc(c.lastText || 'まだメッセージはありません') + '</span></span>' +
+        (c.unread ? '<span class="badge">' + c.unread + '</span>' : '') +
+      '</button>';
+    }).join('') + '</div>';
+  }
+
+  function openChat(convId, back) {
+    state.chat = { convId: convId, data: cache.get('chat:' + convId), files: [], sending: false };
+    state.chatBack = back || (state.screen === 'group' ? 'group' : 'inbox');
+    state.screen = 'chat';
+    render();
+    scrollChatBottom();
+    return call('api_getChat', state.token, convId).then(function (r) {
+      if (!state.chat || state.chat.convId !== convId) return;
+      applyChat(r, true);
+      refreshUnreadSoon();
+    }, function (e) {
+      handleError(e);
+      if (state.token) go(state.chatBack);
+    });
+  }
+
+  function applyChat(r, forceBottom) {
+    var nearBottom = forceBottom || (window.innerHeight + window.scrollY >= document.body.scrollHeight - 120);
+    state.chat.data = r;
+    cache.set('chat:' + state.chat.convId, r);
+    if (state.screen !== 'chat') return;
+    var y = window.scrollY;
+    renderKeepingInput('msg-body');
+    if (nearBottom) scrollChatBottom(); else window.scrollTo(0, y);
+  }
+
+  function scrollChatBottom() {
+    window.scrollTo(0, document.body.scrollHeight);
+  }
+
+  function viewChat() {
+    var c = state.chat;
+    if (!c) return '';
+    var d = c.data;
+    var msgs = '';
+    if (!d) {
+      msgs = '<div class="muted center small">読み込み中…</div>';
+    } else if (!d.messages.length) {
+      msgs = '<div class="muted center small" style="padding:24px 0">まだメッセージはありません</div>';
+    } else {
+      var lastDay = '';
+      var isGroup = d.conv.type === 'group';
+      msgs = (d.hasMore ? '<div class="muted center small">これより前のメッセージは省略しています（最新' + d.messages.length + '件）</div>' : '') +
+        d.messages.map(function (m) {
+          var day = new Date(m.createdAt).toDateString();
+          var sep = '';
+          if (day !== lastDay) {
+            lastDay = day;
+            sep = '<div class="day-sep"><span>' + fmtYmdJa(dateToYmd(new Date(m.createdAt))) + '</span></div>';
+          }
+          var t = new Date(m.createdAt);
+          var time = t.getHours() + ':' + pad(t.getMinutes());
+          var body = (m.body ? '<div class="bubble-text">' + richText(m.body) + '</div>' : '') + filesView(m.files) +
+            (m.expiredFiles ? '<div class="file-expired">添付ファイル（' + m.expiredFiles + '件）は、保存期間（6か月）を過ぎたため削除されました</div>' : '');
+          if (m.mine) {
+            var read = m.readCount > 0 ? (isGroup ? '既読 ' + m.readCount : '既読') : '';
+            return sep + '<div class="msg mine"><div class="msg-meta">' + (read ? '<span class="read">' + read + '</span>' : '') + '<span>' + time + '</span></div>' +
+              '<div class="bubble" data-action="msgMenu" data-id="' + esc(m.id) + '">' + body + '</div></div>';
+          }
+          return sep + '<div class="msg other"><div class="avatar">' + esc((m.authorName || '?').slice(0, 1)) + '</div>' +
+            '<div class="msg-col">' + (isGroup ? '<div class="msg-name">' + esc(m.authorName) + '</div>' : '') +
+            '<div class="msg-line"><div class="bubble">' + body + '</div><span class="msg-meta">' + time + '</span></div></div></div>';
+        }).join('');
+    }
+    return '<div class="chat-log">' + msgs + '</div>' +
+      '<form class="composer" data-form="chat">' +
+        '<div id="att-chat" class="att-list">' + attListHtml(c.files, 'chat') + '</div>' +
+        '<div class="composer-row">' +
+          '<label class="composer-btn" aria-label="画像・PDFを添付">' + icon('clip', 22) +
+            '<input type="file" multiple accept="image/*,application/pdf" data-upload="chat" class="sr-only"></label>' +
+          '<label for="msg-body" class="sr-only">メッセージ</label>' +
+          '<textarea id="msg-body" name="body" rows="1" maxlength="2000" placeholder="メッセージを入力" data-autogrow="1"></textarea>' +
+          '<button type="submit" class="composer-send" aria-label="送信"' + (c.sending ? ' disabled' : '') + '>' + icon('send', 20) + '</button>' +
+        '</div>' +
+      '</form>';
+  }
+
+  // 未読数（下のメニューのバッジ）を少し後に更新
+  var unreadTimer = null;
+  function refreshUnreadSoon() {
+    clearTimeout(unreadTimer);
+    unreadTimer = setTimeout(function () {
+      if (!state.token) return;
+      call('api_homeSummary', state.token, todayStr()).then(function (s) {
+        state.summary = s;
+        cache.set('summary', s);
+        if (SAFE_TO_RENDER.indexOf(state.screen) >= 0) render();
+      }, function () {});
+    }, 800);
+  }
+
+  // 入力欄のない画面だけ、自動更新で書き換える
+  var SAFE_TO_RENDER = ['home', 'board', 'inbox', 'menu', 'groups', 'calendar', 'territory'];
+
+  // ---------- 区域カード ----------
+  function terrTitle(c) { return (c.type === 'list' ? 'リスト ' : '区域 ') + c.number + (c.name ? ' ' + c.name : ''); }
+  function isList(c) { return c.type === 'list'; }
+  function notList(c) { return c.type !== 'list'; }
+
+  // リストの1行（借りる・返却はなく、全員がいつでも開ける）
+  function listRow(c) {
+    return '<div class="terr-row" data-name="' + esc(c.number + ' ' + (c.name || '')) + '">' +
+      '<button class="terr-open" data-action="openTerr" data-id="' + esc(c.id) + '">' +
+        '<span class="terr-no list">' + esc(c.number) + '</span>' +
+        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : 'リスト ' + esc(c.number)) +
+          (c.warnCount ? ' <span class="tag imp">要注意 ' + c.warnCount + '</span>' : '') + '</span>' +
+          (c.commentCount ? '<span class="muted small">コメント ' + c.commentCount + '件</span>' : '') +
+        '</span><span class="chev">' + icon('next', 18) + '</span></button>' +
+    '</div>';
+  }
+  function fmtShortDay(s) { if (!s) return ''; var d = parseYmd(s); return (d.getMonth() + 1) + '/' + d.getDate(); }
+
+  function loadTerritories() {
+    state.terr = state.terr || cache.get('terr');
+    render();
+    return call('api_territories', state.token).then(function (r) {
+      state.terr = r;
+      cache.set('terr', r);
+      if (state.screen === 'territory' || state.screen === 'terrAdmin') renderKeepingInput('terr-search');
+    }, handleError);
+  }
+
+  function terrStatus(c) {
+    if (c.held) {
+      var who = c.heldByMe ? 'あなた' : esc(c.holderName);
+      var due = c.dueDate ? '（期限 ' + fmtShortDay(c.dueDate) + (c.overdue ? '・超過' : '') + '）' : '';
+      return '<span class="' + (c.overdue ? 'st-bad' : 'st-held') + '">' + who + 'が貸出中' + due + '</span>';
+    }
+    return c.available ? '<span class="st-free">貸出可</span>' : '<span class="muted">貸出対象外</span>';
+  }
+
+  function terrRow(c) {
+    var last = c.lastUsedDate ? '前回：' + esc(c.lastUserName || '') + '・' + fmtShortDay(c.lastUsedDate) + 'に使用' : (c.lastUserName ? '前回：' + esc(c.lastUserName) : '');
+    return '<div class="terr-row" data-name="' + esc(c.number + ' ' + (c.name || '')) + '">' +
+      '<button class="terr-open" data-action="openTerr" data-id="' + esc(c.id) + '">' +
+        '<span class="terr-no' + (c.needReturn ? ' warn' : '') + '">' + c.number + '</span>' +
+        '<span class="terr-main"><span class="terr-name">' + (c.name ? esc(c.name) : '区域 ' + c.number) +
+          (c.type === 'list' ? ' <span class="tag soon">リスト</span>' : '') +
+          (c.warnCount ? ' <span class="tag imp">要注意 ' + c.warnCount + '</span>' : '') + '</span>' +
+        '<span class="small">' + terrStatus(c) + '</span>' +
+        (last ? '<span class="muted small">' + last + '</span>' : '') +
+        (c.needReturn ? '<span class="small st-warn">' + icon('warn', 14) + '貸出対象外になりました。返却をお願いします</span>' : '') +
+        '</span></button>' +
+      (c.available && !c.held ? '<button class="btn small primary" data-action="borrowTerr" data-id="' + esc(c.id) + '">借りる</button>' : '') +
+    '</div>';
+  }
+
+  // 区域番号の扱い（「1-2」→親番号「1」）
+  function terrParent(label) { return String(label).split('-')[0]; }
+  function terrKey(label) { var p = String(label).split('-'); return [Number(p[0]) || 0, Number(p[1]) || 0]; }
+  function normTerrLabel(v) {
+    v = String(v || '').trim()
+      .replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); })
+      .replace(/\s*[_‐－ー−―\-]\s*/g, '-');
+    var m = v.match(/^(\d{1,4})(?:-(\d{1,3}))?$/);
+    return m ? (m[2] ? Number(m[1]) + '-' + Number(m[2]) : String(Number(m[1]))) : '';
+  }
+
+  // 親番号ごとのまとまり（枝番のない1枚だけの番号は、そのまま1行で表示）
+  var terrOpen = {};   // 開いている親番号（この端末の表示中だけ覚える）
+  function terrGroups(cards, key) {
+    var order = [], map = {};
+    cards.forEach(function (c) {
+      var p = terrParent(c.number);
+      if (!map[p]) { map[p] = []; order.push(p); }
+      map[p].push(c);
+    });
+    return order.map(function (p) {
+      var list = map[p];
+      var single = list.length === 1 && String(list[0].number).indexOf('-') < 0;
+      if (single) return terrRow(list[0]);
+      var openKey = key + ':' + p;
+      var open = !!terrOpen[openKey];
+      var avail = list.filter(function (c) { return c.available && !c.held; }).length;
+      var held = list.filter(function (c) { return c.held; }).length;
+      var warn = list.reduce(function (n, c) { return n + (c.warnCount || 0); }, 0);
+      var need = list.some(function (c) { return c.needReturn || c.overdue; });
+      var sub = list.length + '枚' + (avail ? '・貸出可 ' + avail : '') + (held ? '・貸出中 ' + held : '');
+      return '<div class="terr-group" data-parent="' + esc(p) + '">' +
+        '<button class="terr-parent" data-action="toggleParent" data-key="' + esc(openKey) + '" aria-expanded="' + open + '">' +
+          '<span class="terr-no' + (need ? ' warn' : '') + '">' + esc(p) + '</span>' +
+          '<span class="terr-main"><span class="terr-name">区域 ' + esc(p) + (warn ? ' <span class="tag imp">要注意 ' + warn + '</span>' : '') + '</span>' +
+          '<span class="muted small">' + sub + '</span></span>' +
+          '<span class="chev">' + icon('next', 18) + '</span></button>' +
+        '<div class="terr-children"' + (open ? '' : ' hidden') + '>' + list.map(terrRow).join('') + '</div></div>';
+    }).join('');
+  }
+
+  function viewTerritory() {
+    var t = state.terr;
+    if (!t) return '<div class="muted center">読み込み中…</div>';
+    var lists = t.cards.filter(isList);
+    var cards = t.cards.filter(notList);
+    var seg = '';
+    if (lists.length) {
+      seg = '<div class="seg">' +
+        '<button data-action="terrSeg" data-tab="cards" class="' + (state.terrSeg !== 'lists' ? 'on' : '') + '">区域カード</button>' +
+        '<button data-action="terrSeg" data-tab="lists" class="' + (state.terrSeg === 'lists' ? 'on' : '') + '">リスト（' + lists.length + '）</button>' +
+      '</div>';
+      if (state.terrSeg === 'lists') {
+        return seg +
+          '<input type="text" id="terr-search" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
+          '<div class="muted small">リストは借りずに、全員がいつでも開いて編集できます。</div>' +
+          '<div class="card terr-list">' + lists.map(listRow).join('') + '</div>';
+      }
+    }
+    var mine = cards.filter(function (c) { return c.heldByMe; });
+    var avail = cards.filter(function (c) { return c.available && !c.heldByMe; });
+    var others = t.isAdmin ? cards.filter(function (c) { return !c.available && !c.heldByMe; }) : [];
+    var banner = seg + '<div class="terr-banner"><div><div class="small">今の貸出対象</div><div class="big">' + cards.filter(function (c) { return c.available; }).length + '枚</div></div>' +
+      '<div class="right"><div class="small">返却期限</div><div class="big">借りてから' + t.dueDays + '日</div></div></div>';
+    var html = banner;
+    if (mine.length) html += '<section class="stack" style="gap:8px"><div class="section-title">借りている区域（' + mine.length + '）</div><div class="card terr-list">' + mine.map(terrRow).join('') + '</div></section>';
+    html += '<input type="text" id="terr-search" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み（例：3-2）" aria-label="番号・名前で絞り込み">';
+    html += '<section class="stack" style="gap:8px"><div class="section-title">貸出対象の区域（' + avail.length + '）</div>' +
+      (avail.length ? '<div class="card terr-list">' + terrGroups(avail, 'av') + '</div>' : '<div class="empty">今は貸出対象の区域がありません</div>') + '</section>';
+    if (others.length) html += '<section class="stack" style="gap:8px"><div class="section-title">貸出対象外（管理者のみ表示・' + others.length + '）</div><div class="card terr-list">' + terrGroups(others, 'ot') + '</div></section>';
+    return html;
+  }
+
+  function lendTerr(userId, name) {
+    var c = state.terrCard;
+    return run('api_lendTerritory', state.token, c.id, userId, name).then(function () {
+      toast('貸し出しました。');
+      openTerr(c.id, state.terrBack);
+    });
+  }
+
+  function openTerr(id, back) {
+    var known = state.terr && state.terr.cards.filter(function (c) { return c.id === id; })[0];
+    state.terrCard = known ? JSON.parse(JSON.stringify(known)) : null;
+    if (state.terrCard) state.terrCard.loading = true;
+    state.terrTab = known && known.type === 'list' ? 'list' : 'map';
+    state.terrBack = back || (state.screen === 'terrAdmin' ? 'terrAdmin' : state.screen === 'home' ? 'home' : 'territory');
+    mapView.cardId = null;   // 別のカードを開いたら倍率・位置・全画面を初期状態に
+    state.screen = 'terrCard';
+    render();
+    window.scrollTo(0, 0);
+    return reloadTerrCard(id);
+  }
+
+  function reloadTerrCard(id) {
+    return call('api_territory', state.token, id).then(function (r) {
+      if (state.screen !== 'terrCard' && state.screen !== 'terrLend' && state.screen !== 'terrHistory' && state.screen !== 'terrEdit') return;
+      state.terrCard = r;
+      if (state.screen === 'terrCard') renderKeepingInput('tc-body');
+    }, function (e) {
+      handleError(e);
+      if (state.token) go('territory');
+    });
+  }
+
+  function viewTerrCard() {
+    var c = state.terrCard;
+    if (!c) return '<div class="muted center">読み込み中…</div>';
+    if (isList(c)) return viewListCard(c);
+    var info = '<div class="card terr-info">' +
+      '<div class="ti-row"><span class="muted">状態</span><span>' + terrStatus(c) + '</span></div>' +
+      (c.held && c.borrowedAt ? '<div class="ti-row"><span class="muted">借りた日</span><span>' + fmtDay(c.borrowedAt) + '</span></div>' : '') +
+      '<div class="ti-row"><span class="muted">前回の使用</span><span>' + (c.lastUserName ? esc(c.lastUserName) + (c.lastUsedDate ? '・' + fmtYmdJa(c.lastUsedDate) + 'に使用' : '') : 'まだ記録がありません') + '</span></div>' +
+    '</div>';
+    if (c.needReturn && c.heldByMe) info = '<div class="notice">' + icon('warn', 16) + ' この区域は貸出対象外になりました。返却をお願いします。</div>' + info;
+
+    var actions = '';
+    if (c.canBorrow) actions += '<button class="btn primary block" data-action="borrowTerr" data-id="' + esc(c.id) + '">この区域を借りる</button>';
+    if (c.canReturn) actions += '<button class="btn primary block" data-action="returnTerr">' + (c.heldByMe ? '返却する' : '代理で返却する') + '</button>';
+    if (c.isAdmin) {
+      actions += '<div class="actions">' +
+        (!c.held ? '<button class="btn small outline" data-action="lendTerr">代理で貸し出す</button>' : '') +
+        '<button class="btn small outline" data-action="terrHistory">' + icon('history', 16) + '使用履歴</button>' +
+        '<button class="btn small outline" data-action="editTerr">編集</button>' +
+      '</div>';
+    }
+
+    var tabs = [[c.type === 'list' ? 'list' : 'map', c.type === 'list' ? 'リスト' : '地図'], ['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]];
+    var tabHtml = '<div class="tabs">' + tabs.map(function (t) {
+      return '<button class="' + (state.terrTab === t[0] ? 'on' : '') + '" data-action="terrTab" data-tab="' + t[0] + '">' + t[1] + '</button>';
+    }).join('') + '</div>';
+
+    var warn = (c.comments || []).filter(function (x) { return x.warn; });
+    var warnBox = warn.length ? '<div class="warn-box">' + icon('warn', 16) + '<div>' + warn.map(function (x) { return '<div>' + esc(x.body) + '</div>'; }).join('') + '</div></div>' : '';
+
+    var body;
+    if (state.terrTab === 'comments') body = viewTerrComments(c);
+    else if (state.terrTab === 'list') body = viewTerrList(c);
+    else body = viewTerrMap(c);
+    return info + actions + warnBox + tabHtml + body;
+  }
+
+  // リスト：表の表示・編集とコメント（借りる・返却はなし）
+  function viewListCard(c) {
+    var top = '<div class="card stack">' +
+      (c.sheetUrl
+        ? '<a class="btn outline block" href="' + esc(c.sheetUrl) + '" target="_blank" rel="noopener">' + icon('open', 16) + 'スプレッドシートで開く</a>' +
+          '<div class="muted small">スプレッドシートを共有されている人だけが開けます。共有されていない人は、下の表で表示・編集できます。</div>'
+        : '<div class="muted small">読み込み中…</div>') +
+      (c.isAdmin ? '<div class="actions"><button class="btn small outline" data-action="editTerr">編集</button></div>' : '') +
+    '</div>';
+    var tabs = [['list', '表'], ['comments', 'コメント' + (c.commentCount ? '（' + c.commentCount + '）' : '')]];
+    var tabHtml = '<div class="tabs">' + tabs.map(function (t) {
+      return '<button class="' + (state.terrTab === t[0] ? 'on' : '') + '" data-action="terrTab" data-tab="' + t[0] + '">' + t[1] + '</button>';
+    }).join('') + '</div>';
+    var warn = (c.comments || []).filter(function (x) { return x.warn; });
+    var warnBox = warn.length ? '<div class="warn-box">' + icon('warn', 16) + '<div>' + warn.map(function (x) { return '<div>' + esc(x.body) + '</div>'; }).join('') + '</div></div>' : '';
+    return top + warnBox + tabHtml + (state.terrTab === 'comments' ? viewTerrComments(c) : viewTerrList(c));
+  }
+
+  // ----- 地図と書き込み -----
+  var INK_COLORS = { k: '#222222', r: '#C62828', b: '#1565C0' };
+  // history：元に戻すための記録（add＝書いた、del＝消した）
+  var ink = { items: [], history: [], tool: 'move', color: 'k', saveTimer: null, status: '' };
+
+  // 地図の表示状態（倍率・表示位置・全画面）は、画面を描き直しても保つ
+  var MAP_ZOOMS = [1, 1.5, 2, 3, 4, 6];
+  var MAP_MAX_ZOOM = 6;
+  var mapView = { cardId: null, zoom: 1, sl: 0, st: 0, full: false };
+
+  function viewTerrMap(c) {
+    if (!c.fileId) return c.loading ? '<div class="muted center small">読み込み中…</div>' : '<div class="empty">地図が登録されていません</div>';
+    var tool = function (key, ic, label, extra) {
+      return '<button type="button" class="tool' + (ink.tool === key ? ' on' : '') + '" data-action="inkTool" data-tool="' + key + '" aria-label="' + label + '" title="' + label + '">' + (extra || icon(ic, 20)) + '</button>';
+    };
+    var tools = '';
+    if (c.canInk) {
+      tools = '<div class="map-tools">' +
+        tool('move', 'hand', '移動・拡大') +
+        tool('pen', 'pen', 'ペン') +
+        tool('o', '', '○を置く', '<span class="stamp">○</span>') +
+        tool('x', '', '✕を置く', '<span class="stamp">✕</span>') +
+        tool('erase', 'eraser', '消しゴム（触れた書き込みを消す）') +
+        '<span class="colors">' + ['k', 'r', 'b'].map(function (k) {
+          return '<button type="button" class="color' + (ink.color === k ? ' on' : '') + '" style="background:' + INK_COLORS[k] + '" data-action="inkColor" data-color="' + k + '" aria-label="' + ({ k: '黒', r: '赤', b: '青' })[k] + '"></button>';
+        }).join('') + '</span>' +
+        '<button type="button" class="tool" data-action="inkUndo" aria-label="元に戻す" title="元に戻す">' + icon('undo', 20) + '</button>' +
+      '</div>';
+    }
+    var zoom = '<div class="map-zoom"><button type="button" data-action="mapZoom" data-d="-1" aria-label="縮小">−</button>' +
+      '<span id="map-zoom-label">' + Math.round(mapView.zoom * 100) + '%</span>' +
+      '<button type="button" data-action="mapZoom" data-d="1" aria-label="拡大">＋</button>' +
+      '<button type="button" class="full-btn" data-action="mapFull" aria-label="全画面表示">' + (mapView.full ? '閉じる' : '全画面') + '</button>' +
+      '<span class="ink-status muted small" id="ink-status">' + esc(ink.status) + '</span></div>';
+    var note = c.canInk
+      ? '<div class="muted small">2本指で拡大・縮小・移動できます。ペンなどを選んでいるときは、1本指で書き込みます。書き込みは自動で保存され、次に借りる人に引き継がれます。消しゴムで触れた線や印が消えます' +
+        (c.isAdmin ? '（区域カード管理者はすべて消せます）。' : '（消せるのは自分が書いたものだけです）。') + '</div>'
+      : '<div class="muted small">2本指で拡大・縮小・移動できます。書き込めるのは、借りている人と区域カード管理者だけです。</div>';
+    var clear = c.isAdmin ? '<button class="linkbtn danger-text" data-action="inkClear">書き込みを全消去（区域カード管理者）</button>' : '';
+    return '<div class="map-area' + (mapView.full ? ' full' : '') + '" id="map-area">' + tools + zoom +
+      '<div class="map-wrap" id="map-wrap"><div class="map-inner" id="map-inner">' +
+        '<img id="map-img" alt="区域' + c.number + 'の地図" draggable="false">' +
+        '<canvas id="map-ink"></canvas>' +
+      '</div></div></div>' + note + clear;
+  }
+
+  function mountMap() {
+    var c = state.terrCard;
+    var img = document.getElementById('map-img');
+    if (!c || !img || !c.fileId) return;
+    if (mapView.cardId !== c.id) {
+      mapView = { cardId: c.id, zoom: 1, sl: 0, st: 0, full: false };
+      var area = document.getElementById('map-area');
+      if (area) area.classList.remove('full');
+    }
+    if (ink.cardId !== c.id || (!c.loading && ink.loadedFrom !== c.ink && !ink.dirty)) {
+      // カードを開いたとき・最新の書き込みを受け取ったとき
+      ink.cardId = c.id;
+      ink.loadedFrom = c.ink;
+      try { ink.items = c.ink ? (JSON.parse(c.ink).items || []) : []; } catch (e) { ink.items = []; }
+      ink.history = [];
+      if (!c.canInk) ink.tool = 'move';
+    }
+    document.body.classList.toggle('map-full-open', mapView.full);
+    loadFile(c.fileId).then(function (f) {
+      var im = document.getElementById('map-img');
+      if (!im) return;
+      if (im.src !== f.url) {
+        im.onload = function () { applyMapZoom(mapView.zoom); restoreMapScroll(); };
+        im.src = f.url;
+      } else {
+        applyMapZoom(mapView.zoom);
+        restoreMapScroll();
+      }
+    }, function () { img.alt = '地図を読み込めませんでした'; });
+    var wrap = document.getElementById('map-wrap');
+    if (wrap && !wrap.dataset.bound) {
+      wrap.dataset.bound = '1';
+      wrap.addEventListener('pointerdown', mapDown);
+      wrap.addEventListener('pointermove', mapMove);
+      wrap.addEventListener('pointerup', mapUp);
+      wrap.addEventListener('pointercancel', mapUp);
+      wrap.addEventListener('lostpointercapture', mapUp);
+      wrap.addEventListener('scroll', function () {
+        mapView.sl = wrap.scrollLeft;
+        mapView.st = wrap.scrollTop;
+      });
+      // パソコンでは Ctrl＋ホイールで拡大・縮小
+      wrap.addEventListener('wheel', function (e) {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        zoomAt(mapView.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), e.clientX, e.clientY);
+      }, { passive: false });
+    }
+  }
+
+  function restoreMapScroll() {
+    var wrap = document.getElementById('map-wrap');
+    if (!wrap) return;
+    wrap.scrollLeft = mapView.sl;
+    wrap.scrollTop = mapView.st;
+  }
+
+  // 倍率を変える（地図の幅＝表示枠の幅×倍率）
+  function applyMapZoom(z) {
+    var wrap = document.getElementById('map-wrap');
+    var inner = document.getElementById('map-inner');
+    if (!wrap || !inner) return;
+    mapView.zoom = Math.max(1, Math.min(MAP_MAX_ZOOM, z));
+    inner.style.width = Math.round(wrap.clientWidth * mapView.zoom) + 'px';
+    var lb = document.getElementById('map-zoom-label');
+    if (lb) lb.textContent = Math.round(mapView.zoom * 100) + '%';
+    scheduleDraw();
+  }
+
+  // 指の位置（clientX/Y）を中心に拡大・縮小する
+  function zoomAt(z, cx, cy) {
+    var wrap = document.getElementById('map-wrap');
+    if (!wrap) return;
+    var r = wrap.getBoundingClientRect();
+    var ax = cx - r.left, ay = cy - r.top;
+    var old = mapView.zoom;
+    var nz = Math.max(1, Math.min(MAP_MAX_ZOOM, z));
+    var contentX = (wrap.scrollLeft + ax) / old;
+    var contentY = (wrap.scrollTop + ay) / old;
+    applyMapZoom(nz);
+    wrap.scrollLeft = contentX * nz - ax;
+    wrap.scrollTop = contentY * nz - ay;
+    mapView.sl = wrap.scrollLeft;
+    mapView.st = wrap.scrollTop;
+  }
+
+  var drawPending = false;
+  function scheduleDraw() {
+    if (drawPending) return;
+    drawPending = true;
+    requestAnimationFrame(function () { drawPending = false; drawInk(); });
+  }
+
+  function drawInk() {
+    var img = document.getElementById('map-img');
+    var cv = document.getElementById('map-ink');
+    if (!img || !cv || !img.naturalWidth) return;
+    var w = img.clientWidth, h = img.clientHeight;
+    // 大きく拡大したとき、スマホで描けない大きさにならないよう解像度を抑える
+    var dpr = Math.min(window.devicePixelRatio || 1, 2, Math.sqrt(12000000 / Math.max(1, w * h)));
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+    cv.style.width = w + 'px';
+    cv.style.height = h + 'px';
+    var ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ink.items.concat(ink.current ? [ink.current] : []).forEach(function (it) { drawItem(ctx, it, w, h); });
+  }
+
+  function drawItem(ctx, it, w, h) {
+    ctx.strokeStyle = INK_COLORS[it.c] || INK_COLORS.k;
+    if (it.t === 'p') {
+      ctx.lineWidth = Math.max(2, w * 0.004);
+      ctx.beginPath();
+      for (var i = 0; i < it.p.length; i += 2) {
+        var x = it.p[i] / 1000 * w, y = it.p[i + 1] / 1000 * h;
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      if (it.p.length === 2) ctx.lineTo(it.p[0] / 1000 * w + 0.1, it.p[1] / 1000 * h);
+      ctx.stroke();
+    } else {
+      var cx = it.x / 1000 * w, cy = it.y / 1000 * h, r = Math.max(8, w * 0.022);
+      ctx.lineWidth = Math.max(2.5, w * 0.005);
+      ctx.beginPath();
+      if (it.t === 'o') {
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      } else {
+        ctx.moveTo(cx - r, cy - r); ctx.lineTo(cx + r, cy + r);
+        ctx.moveTo(cx + r, cy - r); ctx.lineTo(cx - r, cy + r);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // 画面上の位置を、地図上の位置（0〜1000）に変換
+  function mapPoint(clientX, clientY) {
+    var cv = document.getElementById('map-ink');
+    var r = cv.getBoundingClientRect();
+    return [Math.round(Math.min(1, Math.max(0, (clientX - r.left) / r.width)) * 1000), Math.round(Math.min(1, Math.max(0, (clientY - r.top) / r.height)) * 1000)];
+  }
+
+  // ----- 指の操作：1本指＝書き込み（移動モードでは移動）、2本指＝拡大・縮小と移動 -----
+  var gesture = { pts: {}, mode: null };
+
+  function canDrawNow() {
+    var c = state.terrCard;
+    return ink.tool !== 'move' && c && c.canInk && !c.loading;
+  }
+
+  function mapDown(e) {
+    var wrap = e.currentTarget;
+    gesture.pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+    try { wrap.setPointerCapture(e.pointerId); } catch (err) {}
+    var ids = Object.keys(gesture.pts);
+    if (ids.length === 1) {
+      if (canDrawNow()) {
+        e.preventDefault();
+        gesture.mode = 'draw';
+        drawStart(e.clientX, e.clientY);
+      } else {
+        gesture.mode = 'pan';
+        gesture.last = { x: e.clientX, y: e.clientY };
+      }
+    } else if (ids.length === 2) {
+      // 2本目の指が触れたら、書きかけの線は取り消して拡大・移動に切り替える
+      cancelDraw();
+      var a = gesture.pts[ids[0]], b = gesture.pts[ids[1]];
+      gesture.mode = 'pinch';
+      gesture.d0 = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
+      gesture.z0 = mapView.zoom;
+      gesture.mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    }
+  }
+
+  function mapMove(e) {
+    if (!gesture.pts[e.pointerId]) return;
+    gesture.pts[e.pointerId] = { x: e.clientX, y: e.clientY };
+    var wrap = document.getElementById('map-wrap');
+    if (!wrap) return;
+    if (gesture.mode === 'draw') {
+      e.preventDefault();
+      drawMove(e.clientX, e.clientY);
+    } else if (gesture.mode === 'pan') {
+      e.preventDefault();
+      var dx = e.clientX - gesture.last.x, dy = e.clientY - gesture.last.y;
+      gesture.last = { x: e.clientX, y: e.clientY };
+      panBy(wrap, dx, dy);
+    } else if (gesture.mode === 'pinch') {
+      e.preventDefault();
+      var ids = Object.keys(gesture.pts);
+      if (ids.length < 2) return;
+      var a = gesture.pts[ids[0]], b = gesture.pts[ids[1]];
+      var mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      var d = Math.max(10, Math.hypot(a.x - b.x, a.y - b.y));
+      zoomAt(gesture.z0 * d / gesture.d0, mid.x, mid.y);
+      panBy(wrap, mid.x - gesture.mid.x, mid.y - gesture.mid.y);
+      gesture.mid = mid;
+    }
+  }
+
+  // 地図を動かす。地図の端まで来たら、残りはページ全体をスクロール
+  function panBy(wrap, dx, dy) {
+    var bl = wrap.scrollLeft, bt = wrap.scrollTop;
+    wrap.scrollLeft = bl - dx;
+    wrap.scrollTop = bt - dy;
+    var restY = -dy - (wrap.scrollTop - bt);
+    if (Math.abs(restY) > 0.5 && !mapView.full) window.scrollBy(0, restY);
+    mapView.sl = wrap.scrollLeft;
+    mapView.st = wrap.scrollTop;
+  }
+
+  function mapUp(e) {
+    if (!gesture.pts[e.pointerId]) return;
+    delete gesture.pts[e.pointerId];
+    var left = Object.keys(gesture.pts).length;
+    if (gesture.mode === 'draw' && left === 0) drawEnd();
+    if (gesture.mode === 'pinch' && left === 1) {
+      // 1本指が残ったら、そのまま移動を続ける（書き込みはしない）
+      var id = Object.keys(gesture.pts)[0];
+      gesture.mode = 'pan';
+      gesture.last = { x: gesture.pts[id].x, y: gesture.pts[id].y };
+    }
+    if (left === 0) gesture.mode = null;
+  }
+
+  function drawStart(cx, cy) {
+    var p = mapPoint(cx, cy);
+    var me = state.user.id;
+    if (ink.tool === 'erase') {
+      ink.erasing = { count: 0, blocked: false };
+      eraseAt(p);
+      return;
+    }
+    if (ink.tool === 'pen') {
+      ink.current = { t: 'p', c: ink.color, a: me, p: [p[0], p[1]] };
+      scheduleDraw();
+      return;
+    }
+    // ○・✕は、指を離したときに置く（2本指の操作と区別するため）
+    ink.pendingStamp = { t: ink.tool, c: ink.color, a: me, x: p[0], y: p[1] };
+  }
+
+  function drawMove(cx, cy) {
+    var p = mapPoint(cx, cy);
+    if (ink.erasing) { eraseAt(p); return; }
+    if (ink.pendingStamp) {
+      ink.pendingStamp.x = p[0];
+      ink.pendingStamp.y = p[1];
+      return;
+    }
+    if (!ink.current) return;
+    var a = ink.current.p;
+    var dx = p[0] - a[a.length - 2], dy = p[1] - a[a.length - 1];
+    if (dx * dx + dy * dy < 16) return;   // 細かすぎる点は省いてデータを軽くする
+    a.push(p[0], p[1]);
+    scheduleDraw();
+  }
+
+  function drawEnd() {
+    if (ink.erasing) {
+      var er = ink.erasing;
+      ink.erasing = null;
+      if (er.count) inkChanged();
+      else if (er.blocked) toast('ほかの人が書いたものは消せません。', true);
+      return;
+    }
+    if (ink.pendingStamp) {
+      var st = ink.pendingStamp;
+      ink.pendingStamp = null;
+      ink.items.push(st);
+      ink.history.push({ op: 'add', item: st });
+      inkChanged();
+      scheduleDraw();
+      return;
+    }
+    if (!ink.current) return;
+    ink.items.push(ink.current);
+    ink.history.push({ op: 'add', item: ink.current });
+    ink.current = null;
+    inkChanged();
+    scheduleDraw();
+  }
+
+  function cancelDraw() {
+    ink.current = null;
+    ink.pendingStamp = null;
+    if (ink.erasing) {
+      // 2本指になる前に消したものは、そのまま保存する
+      var er = ink.erasing;
+      ink.erasing = null;
+      if (er.count) inkChanged();
+    }
+    scheduleDraw();
+  }
+
+  // 消しゴム：触れた書き込みを1つずつ丸ごと消す
+  function canErase(it) {
+    return !!(state.terrCard && (state.terrCard.isAdmin || it.a === state.user.id));
+  }
+
+  function hitTest(it, p, w, h, tol) {
+    var px = p[0] / 1000 * w, py = p[1] / 1000 * h;
+    if (it.t === 'p') {
+      for (var i = 0; i < it.p.length; i += 2) {
+        var x1 = it.p[i] / 1000 * w, y1 = it.p[i + 1] / 1000 * h;
+        var x2 = i + 3 < it.p.length ? it.p[i + 2] / 1000 * w : x1;
+        var y2 = i + 3 < it.p.length ? it.p[i + 3] / 1000 * h : y1;
+        if (distToSeg(px, py, x1, y1, x2, y2) <= tol) return true;
+      }
+      return false;
+    }
+    var r = Math.max(8, w * 0.022);
+    var dx = px - it.x / 1000 * w, dy = py - it.y / 1000 * h;
+    return Math.sqrt(dx * dx + dy * dy) <= r + tol;
+  }
+
+  function distToSeg(px, py, x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1;
+    var len = dx * dx + dy * dy;
+    var t = len ? Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / len)) : 0;
+    var cx = x1 + t * dx - px, cy = y1 + t * dy - py;
+    return Math.sqrt(cx * cx + cy * cy);
+  }
+
+  function eraseAt(p) {
+    var cv = document.getElementById('map-ink');
+    if (!cv) return;
+    var w = cv.clientWidth, h = cv.clientHeight;
+    // 消しゴムの大きさは、画面上でほぼ一定（拡大しても指の太さくらい）
+    var tol = 14;
+    for (var i = ink.items.length - 1; i >= 0; i--) {
+      var it = ink.items[i];
+      if (!hitTest(it, p, w, h, tol)) continue;
+      if (!canErase(it)) { ink.erasing.blocked = true; continue; }
+      ink.items.splice(i, 1);
+      ink.history.push({ op: 'del', item: it, index: i });
+      ink.erasing.count++;
+    }
+    scheduleDraw();
+  }
+
+  function setInkStatus(t) {
+    ink.status = t;
+    var el = document.getElementById('ink-status');
+    if (el) el.textContent = t;
+  }
+
+  function inkChanged() {
+    ink.dirty = true;
+    setInkStatus('保存待ち…');
+    clearTimeout(ink.saveTimer);
+    ink.saveTimer = setTimeout(saveInk, 1200);
+  }
+
+  function saveInk() {
+    var id = ink.cardId;
+    if (!id) return;
+    var data = ink.items.length ? JSON.stringify({ v: 1, items: ink.items }) : '';
+    setInkStatus('保存中…');
+    call('api_saveInk', state.token, id, data).then(function () {
+      if (ink.cardId === id) {
+        ink.dirty = false;
+        ink.loadedFrom = data;
+        if (state.terrCard && state.terrCard.id === id) state.terrCard.ink = data;
+      }
+      setInkStatus('保存しました');
+    }, function (e) {
+      setInkStatus('保存できませんでした');
+      handleError(e);
+      // サーバーの内容に戻す
+      if (ink.cardId === id) {
+        ink.dirty = false;
+        ink.loadedFrom = null;
+        if (state.screen === 'terrCard' && state.terrCard && state.terrCard.id === id) reloadTerrCard(id);
+      }
+    });
+  }
+
+  // ----- リスト型 -----
+  // 文字の中のURLを見つける（リンクとして開けるように）
+  function findUrl(text) {
+    var m = String(text || '').match(/https?:\/\/[^\s"'<>]+/);
+    return m ? m[0] : '';
+  }
+
+  // リストのシートを読み込む（シートの切り替え・更新）
+  function loadListSheet(gid) {
+    var c = state.terrCard;
+    if (!c || !c.list) return Promise.resolve();
+    var keepX = 0;
+    var w = document.querySelector('.sheet-tabs');
+    if (w) keepX = w.scrollLeft;
+    c.list.gid = gid;
+    c.listLoading = true;
+    render();
+    return call('api_listSheet', state.token, c.id, gid).then(function (list) {
+      if (state.terrCard !== c) return;
+      c.list = list;
+      c.listLoading = false;
+      render();
+      var w2 = document.querySelector('.sheet-tabs');
+      if (w2) w2.scrollLeft = keepX;
+    }, function (e) {
+      c.listLoading = false;
+      render();
+      handleError(e);
+    });
+  }
+
+  function viewTerrList(c) {
+    if (c.loading) return '<div class="muted center small">読み込み中…</div>';
+    if (c.listError) return '<div class="notice">' + esc(c.listError) + '</div>';
+    var L = c.list;
+    if (!L) return '<div class="empty">表が空です</div>';
+    var tabs = (L.sheets || []).length > 1
+      ? '<div class="sheet-tabs">' + L.sheets.map(function (s) {
+          return '<button class="' + (s.gid === L.gid ? 'on' : '') + '" data-action="listSheet" data-gid="' + esc(s.gid) + '">' + esc(s.name) + '</button>';
+        }).join('') + '</div>'
+      : '';
+    if (c.listLoading) return tabs + '<div class="muted center small">読み込み中…</div>';
+    if (!L.header.length) return tabs + '<div class="empty">このシートは空です</div>';
+    var links = L.links || {}, locked = L.locked || {};
+    var head = '<tr><th class="rn">#</th>' + L.header.map(function (h) { return '<th>' + esc(h) + '</th>'; }).join('') + '</tr>';
+    var rows = L.rows.map(function (r, i) {
+      return '<tr><td class="rn">' + (i + 1) + '</td>' + L.header.map(function (h, j) {
+        var key = i + ',' + j, text = r[j] || '';
+        var url = links[key] || findUrl(text);
+        var edit = '<button class="cell" data-action="editCell" data-r="' + i + '" data-c="' + j + '">' + (text ? esc(text) : '<span class="muted">—</span>') + '</button>';
+        if (!url) return '<td>' + edit + '</td>';
+        var a = '<a class="cell-link" href="' + esc(url) + '" target="_blank" rel="noopener">' + icon('open', 14) + esc(text || url) + '</a>';
+        return '<td><div class="cell-wrap">' + a +
+          (locked[key] ? '' : '<button class="cell-edit" data-action="editCell" data-r="' + i + '" data-c="' + j + '" aria-label="編集">' + icon('pen', 14) + '</button>') +
+          '</div></td>';
+      }).join('') + '</tr>';
+    }).join('');
+    return tabs +
+      '<div class="muted small">セルをタップすると編集できます（元のスプレッドシートに保存されます）。リンクはタップで開きます。表は上下左右にスクロールできます</div>' +
+      '<div class="table-wrap"><table class="sheet"><thead>' + head + '</thead><tbody>' + rows + '</tbody></table></div>' +
+      (L.truncated ? '<div class="muted small">表が大きいため、最初の' + L.rows.length + '行だけ表示しています</div>' : '') +
+      '<div class="actions"><button class="btn small outline" data-action="addListRow">' + icon('plus', 16) + '行を追加</button>' +
+      '<button class="btn small outline" data-action="reloadList">最新の内容に更新</button></div>';
+  }
+
+  // ----- コメント -----
+  function viewTerrComments(c) {
+    var list = (c.comments || []).map(function (x) {
+      return '<div class="comment' + (x.warn ? ' warn' : '') + '"><div class="avatar">' + esc((x.authorName || '?').slice(0, 1)) + '</div>' +
+        '<div style="flex:1;min-width:0"><div class="post-meta">' + (x.warn ? '<span class="tag imp">要注意</span>' : '') +
+        '<span style="color:var(--text);font-weight:500">' + esc(x.authorName) + '</span><span>' + fmtDate(x.createdAt) + '</span></div>' +
+        '<div class="comment-body">' + richText(x.body) + '</div></div>' +
+        (x.canDelete ? '<button class="linkbtn small" data-action="deleteTerrComment" data-id="' + esc(x.id) + '">削除</button>' : '') + '</div>';
+    }).join('');
+    var form = c.canComment
+      ? '<form class="stack" data-form="terrComment" style="padding-top:12px">' +
+          '<label for="tc-body" class="sr-only">コメント</label>' +
+          '<textarea id="tc-body" name="body" maxlength="500" placeholder="例：3番の家は留守が多い／〇〇の家は訪問を控える" required></textarea>' +
+          '<label class="check"><input type="checkbox" name="warn">要注意の情報として目立たせる</label>' +
+          '<button class="btn primary block" type="submit">コメントを残す</button>' +
+          (!c.heldByMe && !c.isAdmin ? '<div class="muted small">返却後3日間はコメントを追加できます</div>' : '') +
+        '</form>'
+      : '<div class="muted small" style="padding-top:8px">コメントを書けるのは、借りている人と区域カード管理者だけです</div>';
+    return '<section class="card">' + (list || '<div class="muted small" style="padding:8px 0">まだコメントはありません</div>') + form + '</section>';
+  }
+
+  // ----- 入力ダイアログ（返却・セル編集・行追加） -----
+  var formResolve = null;
+  function formDialog(title, fields, okLabel) {
+    return new Promise(function (resolve) {
+      formResolve = resolve;
+      var d = document.getElementById('dlg');
+      if (!d) {
+        d = document.createElement('div');
+        d.id = 'dlg';
+        d.className = 'dialog';
+        document.body.appendChild(d);
+      }
+      d.innerHTML = '<form class="dialog-box" data-form="dialog" role="dialog" aria-modal="true" aria-label="' + esc(title) + '">' +
+        '<div class="dialog-msg">' + esc(title) + '</div>' +
+        fields.map(function (f, i) {
+          var id = 'dlg-f' + i;
+          var input = f.type === 'textarea'
+            ? '<textarea id="' + id + '" name="f' + i + '" maxlength="1000">' + esc(f.value || '') + '</textarea>'
+            : '<input id="' + id + '" name="f' + i + '" type="' + (f.type || 'text') + '" value="' + esc(f.value || '') + '"' + (f.max ? ' max="' + f.max + '"' : '') + '>';
+          return '<div class="field"><label for="' + id + '">' + esc(f.label) + '</label>' + input + (f.hint ? '<div class="hint muted small">' + esc(f.hint) + '</div>' : '') + '</div>';
+        }).join('') +
+        '<button class="btn primary block" type="submit">' + esc(okLabel || 'OK') + '</button>' +
+        '<button type="button" class="linkbtn" data-action="dialogCancel">キャンセル</button></form>';
+      d.hidden = false;
+      var first = d.querySelector('input,textarea');
+      if (first) setTimeout(function () { first.focus(); }, 50);
+    });
+  }
+  function closeFormDialog(values) {
+    var d = document.getElementById('dlg');
+    if (d) d.hidden = true;
+    var r = formResolve;
+    formResolve = null;
+    if (r) r(values);
+  }
+
+  // ----- 代理で貸し出す -----
+  function viewTerrLend() {
+    var c = state.terrCard;
+    if (!c) return '';
+    var users = state.users ? state.users.map(function (u) {
+      return '<button class="user-item user-pick" data-name="' + esc(u.name) + '" data-action="lendTo" data-id="' + esc(u.id) + '">' +
+        '<span class="avatar">' + esc(u.name.slice(0, 1)) + '</span>' + esc(u.name) + (u.isMe ? '（あなた）' : '') + '</button>';
+    }).join('') : '<div class="muted small">読み込み中…</div>';
+    return '<div class="muted">' + esc(terrTitle(c)) + 'を貸し出す相手を選んでください。</div>' +
+      '<form class="card stack" data-form="lendName"><div class="field"><label for="lend-name">アプリを使っていない人に貸す場合は名前を入力</label>' +
+      '<input id="lend-name" name="name" type="text" maxlength="30" placeholder="例：山田（紙のカード）"></div>' +
+      '<button class="btn outline block" type="submit">この名前で貸し出す</button></form>' +
+      '<input type="text" class="user-filter" data-filter="users" placeholder="メンバーを名前で絞り込み" aria-label="メンバーを名前で絞り込み">' +
+      '<div class="card user-list">' + users + '</div>';
+  }
+
+  // ----- 使用履歴 -----
+  function viewTerrHistory() {
+    var h = state.terrHistory;
+    if (!h) return '<div class="muted center">読み込み中…</div>';
+    if (!h.length) return '<div class="empty">まだ履歴がありません</div>';
+    return '<div class="card">' + h.map(function (r) {
+      return '<div class="hist-row"><div class="member-name">' + esc(r.name) + (r.byAdmin ? ' <span class="tag soon">代理</span>' : '') + '</div>' +
+        '<div class="muted small">' + fmtDay(r.borrowedAt) + ' 〜 ' + (r.returnedAt ? fmtDay(r.returnedAt) : '貸出中（期限 ' + fmtShortDay(r.dueDate) + '）') +
+        (r.usedDate ? '・' + fmtYmdJa(r.usedDate) + 'に使用' : '') + '</div></div>';
+    }).join('') + '</div>';
+  }
+
+  // ----- 編集（番号・名前・リストのURL）／リスト型の新規登録 -----
+  function viewTerrEdit() {
+    var e = state.terrEdit;
+    if (!e) return '';
+    var c = e.card || { number: '', name: '', type: 'list', sheetUrl: '' };
+    var url = c.type === 'list'
+      ? '<div class="field"><label for="te-url">GoogleスプレッドシートのURL</label><input id="te-url" name="url" type="text" value="' + esc(c.sheetUrl || '') + '"' + (e.card ? '' : ' required') + '>' +
+        '<div class="hint muted small">あなたのGoogleアカウントで開ける表を指定してください。シート（タブ）を開いた状態のURLなら、そのシートを読み込みます。1行目は見出しとして扱います</div></div>'
+      : '<div class="field"><label>地図</label><label class="btn small outline att-add">地図を差し替える<input type="file" accept="image/*,application/pdf" data-upload="terrReplace" class="sr-only"></label></div>';
+    return '<form class="card stack" data-form="terrEdit">' +
+      '<div class="field"><label for="te-no">' + (isList(c) ? '番号' : '区域番号') + '</label><input id="te-no" name="number" type="text" inputmode="numeric" maxlength="9" value="' + esc(c.number) + '" placeholder="例：1-1 または 12" required><div class="hint muted small">枝番は「1-1」のようにハイフンで区切ります</div></div>' +
+      '<div class="field"><label for="te-name">名前（任意）</label><input id="te-name" name="name" type="text" maxlength="40" value="' + esc(c.name || '') + '" placeholder="例：駅前"></div>' +
+      url +
+      '<button class="btn primary block" type="submit">保存する</button></form>' +
+      (e.card ? '<button class="linkbtn danger-text" data-action="deleteTerr">' + (isList(c) ? 'このリストを削除する（スプレッドシートは消えません）' : 'この区域カードを削除する') + '</button>' : '');
+  }
+
+  // ----- 区域カードの管理 -----
+  function viewTerrAdmin() {
+    var t = state.terr;
+    if (!t) return '<div class="muted center">読み込み中…</div>';
+    if (!t.isAdmin) return '<div class="empty">区域カード管理者だけが使える画面です</div>';
+    var a = state.terrAdmin = state.terrAdmin || { selected: null, bulk: [] };
+    var cards = t.cards.filter(notList);
+    var lists = t.cards.filter(isList);
+    if (!a.selected) {
+      a.selected = {};
+      cards.forEach(function (c) { if (c.available) a.selected[c.id] = true; });
+    }
+    var count = Object.keys(a.selected).filter(function (k) { return a.selected[k]; }).length;
+    var chip = function (c) {
+      var on = !!a.selected[c.id];
+      var lb = String(c.number).indexOf('-') >= 0 ? String(c.number).split('-')[1] : c.number;
+      return '<button type="button" class="num-chip' + (on ? ' on' : '') + (c.held ? ' held' : '') + '" data-action="toggleAvail" data-id="' + esc(c.id) + '" aria-pressed="' + on + '" title="' + esc(terrTitle(c)) + (c.held ? '（貸出中）' : '') + '">' + esc(lb) + '</button>';
+    };
+    var parents = [], byP = {};
+    cards.forEach(function (c) { var p = terrParent(c.number); if (!byP[p]) { byP[p] = []; parents.push(p); } byP[p].push(c); });
+    var chips = parents.map(function (p) {
+      var list = byP[p];
+      var n = list.filter(function (c) { return a.selected[c.id]; }).length;
+      var stateCls = n === 0 ? '' : n === list.length ? ' on' : ' some';
+      var openKey = 'adm:' + p;
+      var open = !!terrOpen[openKey];
+      return '<div class="avail-row">' +
+        '<button type="button" class="avail-parent' + stateCls + '" data-action="toggleAvailParent" data-parent="' + esc(p) + '" aria-label="区域' + esc(p) + 'をまとめて選択・解除">' +
+          '<b>' + esc(p) + '</b><span>' + n + '/' + list.length + '</span></button>' +
+        (list.length > 1 || String(list[0].number).indexOf('-') >= 0
+          ? '<button type="button" class="avail-open" data-action="toggleParent" data-key="' + esc(openKey) + '" aria-expanded="' + open + '" aria-label="枝番を表示">' + icon('next', 16) + '</button>' +
+            '<div class="avail-children terr-children"' + (open ? '' : ' hidden') + '>' + list.map(chip).join('') + '</div>'
+          : '') +
+      '</div>';
+    }).join('');
+    var bulk = (a.bulk || []).map(function (b) {
+      return '<div class="bulk-row ' + b.state + '"><span>' + esc(b.file) + '</span><span>' + esc(b.msg) + '</span></div>';
+    }).join('');
+    return '<section class="card stack">' +
+        '<div class="section-title">返却期限</div>' +
+        '<form class="row-inline" data-form="dueDays"><label for="due-days">借りてから</label>' +
+        '<input id="due-days" name="days" type="number" min="1" max="365" value="' + t.dueDays + '" class="num-input"><span>日</span>' +
+        '<button class="btn small primary" type="submit">保存</button></form>' +
+        '<div class="muted small">変更後に借りたカードから適用されます</div>' +
+      '</section>' +
+      '<section class="card stack">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline"><div class="section-title">貸出対象の設定</div><span class="small" style="color:var(--accent);font-weight:700">' + count + '枚を選択中</span></div>' +
+        '<form class="row-inline" data-form="availRange"><input name="from" type="text" inputmode="numeric" class="num-input" aria-label="開始番号" placeholder="1"><span>〜</span>' +
+        '<input name="to" type="text" inputmode="numeric" class="num-input" aria-label="終了番号" placeholder="3"><button class="btn small outline" type="submit">範囲で選択</button>' +
+        '<button class="btn small outline" type="button" data-action="availNone">すべて解除</button></form>' +
+        (cards.length ? '<div class="avail-list">' + chips + '</div>' : '<div class="muted small">区域カードがまだ登録されていません</div>') +
+        '<div class="muted small">「1〜3」と入れると1-1〜3-6をまとめて選びます。「2-3〜2-5」のように枝番でも指定できます。親番号をタップするとその枝番をまとめて選択・解除、右の矢印で枝番を1枚ずつ選べます。下線の番号は貸出中です</div>' +
+        '<button class="btn primary block" data-action="saveAvail">貸出対象を保存</button>' +
+      '</section>' +
+      '<section class="card stack">' +
+        '<div class="section-title">地図型の区域をまとめて登録</div>' +
+        '<div class="muted small">地図の画像（JPG・PNG）やPDFを複数選べます。ファイル名の番号を区域番号にします（例：1-1.jpg → 区域1-1、12.jpg → 区域12）。PDFは1ページ目を画像にして登録します。たくさんある場合は、100枚くらいずつに分けて登録してください</div>' +
+        '<label class="check"><input type="checkbox" id="bulk-replace">同じ番号がある場合は地図を差し替える</label>' +
+        '<label class="btn primary att-add">' + icon('plus', 16) + 'ファイルを選んで登録<input type="file" multiple accept="image/*,application/pdf" data-upload="terrBulk" class="sr-only"></label>' +
+        (bulk ? '<div class="bulk-list">' + bulk + '</div>' : '') +
+      '</section>' +
+      '<section class="stack" style="gap:8px"><div class="section-title">登録済みの区域カード（' + cards.length + '）</div>' +
+        '<input type="text" class="user-filter" data-filter="terr" placeholder="番号・名前で絞り込み" aria-label="番号・名前で絞り込み">' +
+        '<div class="card terr-list">' + terrGroups(cards, 'all') + '</div></section>' +
+      '<section class="card stack">' +
+        '<div class="section-title">リスト（' + lists.length + '）</div>' +
+        '<div class="muted small">Googleスプレッドシートの表を登録すると、メンバー全員がアプリの中で表示・編集できます（借りる・返却はありません）。スプレッドシートは非公開のままで大丈夫です</div>' +
+        (lists.length ? '<div class="terr-list">' + lists.map(listRow).join('') + '</div>' : '') +
+        '<button class="btn outline block" data-action="newListTerr">' + icon('plus', 16) + 'リストを登録</button>' +
+      '</section>';
+  }
+
+  // 地図ファイルを登録用の画像に変換（画像は縮小、PDFは1ページ目を画像に）
+  var MAP_MAX = 2400;
+  function mapFileToJpeg(file) {
+    var type = file.type || '';
+    if (type === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+      return Promise.all([readArrayBuffer(file), loadPdfJs()]).then(function (r) {
+        return r[1].getDocument({ data: new Uint8Array(r[0]), cMapUrl: PDFJS_ASSETS_URL + 'cmaps/', cMapPacked: true, standardFontDataUrl: PDFJS_ASSETS_URL + 'standard_fonts/' }).promise;
+      }).then(function (doc) {
+        return doc.getPage(1).then(function (page) {
+          var base = page.getViewport({ scale: 1 });
+          var scale = MAP_MAX / Math.max(base.width, base.height);
+          var vp = page.getViewport({ scale: scale });
+          var c = document.createElement('canvas');
+          c.width = Math.floor(vp.width);
+          c.height = Math.floor(vp.height);
+          var ctx = c.getContext('2d');
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, c.width, c.height);
+          return page.render({ canvasContext: ctx, viewport: vp }).promise.then(function () {
+            doc.destroy();
+            return c.toDataURL('image/jpeg', 0.85).split(',')[1];
+          });
+        });
+      });
+    }
+    if (type.indexOf('image/') === 0) {
+      return readDataUrl(file).then(function (d) { return shrinkImage(d, MAP_MAX, 0.85); });
+    }
+    return Promise.reject(new Error('画像かPDFを選んでください。'));
+  }
+
+  function readArrayBuffer(file) {
+    return new Promise(function (resolve, reject) {
+      var r = new FileReader();
+      r.onload = function () { resolve(r.result); };
+      r.onerror = function () { reject(new Error('ファイルを読み込めませんでした。')); };
+      r.readAsArrayBuffer(file);
+    });
+  }
+
+  // ファイル名から区域番号を読み取る（例：「1-1.jpg」「区域3_2.pdf」「１２.png」）
+  function labelFromFileName(name) {
+    var base = String(name).replace(/\.[^.]+$/, '')
+      .replace(/[０-９]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); });
+    var m = base.match(/(\d{1,4})\s*[_‐－ー−―\-]\s*(\d{1,3})(?!\d)/) || base.match(/(\d{1,4})/);
+    if (!m) return '';
+    return m[2] ? Number(m[1]) + '-' + Number(m[2]) : String(Number(m[1]));
+  }
+
+  function bulkUpload(input) {
+    var files = Array.prototype.slice.call(input.files || []);
+    input.value = '';
+    if (!files.length) return;
+    var replace = !!(document.getElementById('bulk-replace') || {}).checked;
+    var a = state.terrAdmin;
+    a.bulk = files.map(function (f) { return { file: f.name, state: 'wait', msg: '待機中' }; });
+    render();
+    var done = 0, ok = 0;
+    files.reduce(function (p, f, i) {
+      return p.then(function () {
+        var row = a.bulk[i];
+        var label = labelFromFileName(f.name);
+        if (!label) { row.state = 'ng'; row.msg = 'ファイル名に番号がないため、登録しませんでした'; render(); return; }
+        row.state = 'run';
+        row.msg = '区域' + label + 'として登録中…';
+        render();
+        return mapFileToJpeg(f).then(function (b64) {
+          return call('api_saveMapCard', state.token, label, '', 'image/jpeg', b64, replace);
+        }).then(function (r) {
+          ok++;
+          row.state = 'ok';
+          row.msg = '区域' + label + (r.replaced ? 'の地図を差し替えました' : 'を登録しました');
+        }, function (e) {
+          row.state = 'ng';
+          row.msg = errorText(e);
+        }).then(function () {
+          done++;
+          if (state.screen === 'terrAdmin') render();
+        });
+      });
+    }, Promise.resolve()).then(function () {
+      toast(ok + '件を登録しました' + (ok < files.length ? '（' + (files.length - ok) + '件は登録できませんでした）' : '。'), ok < files.length);
+      state.terrAdmin.selected = null;
+      loadTerritories();
+    });
+  }
+
+  function replaceMap(input) {
+    var f = (input.files || [])[0];
+    input.value = '';
+    var c = state.terrEdit && state.terrEdit.card;
+    if (!f || !c) return;
+    setBusy(true);
+    mapFileToJpeg(f).then(function (b64) {
+      return call('api_saveMapCard', state.token, c.number, '', 'image/jpeg', b64, true);
+    }).then(function () {
+      setBusy(false);
+      toast('地図を差し替えました。');
+      fileCache = {};
+      openTerr(c.id, 'territory');
+    }, function (e) {
+      setBusy(false);
+      handleError(e);
+    });
+  }
+
+  // 画面の向きや大きさが変わったら、地図の倍率を合わせ直す
+  window.addEventListener('resize', function () {
+    if (state.screen === 'terrCard' && document.getElementById('map-wrap')) applyMapZoom(mapView.zoom);
+  });
+
+  // ---------- 自動更新 ----------
+  // チャット画面：5秒ごと、メッセージ一覧：15秒ごと、未読バッジ：60秒ごと
+  var tick = 0;
+  var polling = false;
+  setInterval(function () {
+    if (!state.token || polling) return;
+    if (document.visibilityState && document.visibilityState !== 'visible') return;
+    tick++;
+    var job = null;
+    if (state.screen === 'chat' && state.chat && state.chat.data) {
+      var id = state.chat.convId;
+      job = call('api_pollChat', state.token, id, state.chat.data.version).then(function (r) {
+        if (r.changed && state.chat && state.chat.convId === id) applyChat(r, false);
+      });
+    } else if (state.screen === 'inbox' && tick % 3 === 0) {
+      job = refreshInbox();
+    } else if (tick % 12 === 0) {
+      job = call('api_homeSummary', state.token, todayStr()).then(function (s) {
+        var changed = JSON.stringify(s.unread) !== JSON.stringify(state.summary.unread) || s.chatUnread !== state.summary.chatUnread;
+        state.summary = s;
+        cache.set('summary', s);
+        if (changed && SAFE_TO_RENDER.indexOf(state.screen) >= 0) render();
+      });
+    }
+    if (job) {
+      polling = true;
+      job.then(function () { polling = false; }, function () { polling = false; });
+    }
+  }, 5000);
+
+  // ---------- 添付ファイル ----------
+  var FILE_ICONS = {
+    clip: '<path d="M21 11.5 12.5 20a5 5 0 0 1-7-7L14 4.5a3.3 3.3 0 0 1 4.7 4.7L10.2 17.7a1.7 1.7 0 0 1-2.4-2.4L15.5 7.6"></path>',
+    pdf: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><path d="M14 3v6h6"></path>',
+    img: '<rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="9" cy="10" r="2"></circle><path d="M21 17l-5-5-9 8"></path>'
+  };
+  function ficon(name, size) {
+    size = size || 18;
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + FILE_ICONS[name] + '</svg>';
+  }
+  function isImage(f) { return f && f.mime && f.mime.indexOf('image/') === 0; }
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + 'MB';
+    return Math.max(1, Math.round(n / 1024)) + 'KB';
+  }
+
+  // 入力フォーム用：添付ボタンと選択済み一覧
+  function attachPicker(target, files) {
+    return '<div class="att-picker">' +
+      '<div id="att-' + target + '" class="att-list">' + attListHtml(files, target) + '</div>' +
+      '<label class="btn small outline att-add">' + ficon('clip') + '画像・PDFを添付' +
+        '<input type="file" multiple accept="image/*,application/pdf" data-upload="' + target + '" class="sr-only"></label>' +
+      '<div class="hint muted small">最大' + MAX_FILES + 'ファイル。画像は自動で縮小、PDFは5MBまで</div>' +
+    '</div>';
+  }
+
+  function attListHtml(files, target) {
+    return (files || []).map(function (f, i) {
+      return '<div class="att-chip">' + ficon(isImage(f) ? 'img' : 'pdf') +
+        '<span class="att-name">' + esc(f.name) + '</span><span class="muted small">' + fmtSize(f.size) + '</span>' +
+        '<button type="button" class="att-x" data-action="removeAtt" data-target="' + target + '" data-i="' + i + '" aria-label="' + esc(f.name) + 'を外す">×</button></div>';
+    }).join('');
+  }
+
+  function attFiles(target) {
+    if (target === 'compose') return state.compose ? state.compose.files : [];
+    if (target === 'chat') return state.chat ? state.chat.files : [];
+    return state.commentFiles;
+  }
+
+  // 入力中の文章を消さないよう、一覧の部分だけ書き換える
+  function refreshAttList(target) {
+    var el = document.getElementById('att-' + target);
+    if (el) el.innerHTML = attListHtml(attFiles(target), target);
+  }
+
+  function uploadSelected(input) {
+    var target = input.getAttribute('data-upload');
+    var list = attFiles(target);
+    var chosen = Array.prototype.slice.call(input.files || []);
+    input.value = '';
+    if (!chosen.length) return;
+    if (list.length + chosen.length > MAX_FILES) {
+      toast('添付は' + MAX_FILES + 'ファイルまでです。', true);
+      return;
+    }
+    setBusy(true);
+    chosen.reduce(function (p, file) {
+      return p.then(function () {
+        return prepareFile(file).then(function (r) {
+          return call('api_uploadFile', state.token, r.name, r.mime, r.base64);
+        }).then(function (f) {
+          list.push(f);
+          refreshAttList(target);
+        });
+      });
+    }, Promise.resolve()).catch(function (e) {
+      handleError(e);
+    }).then(function () {
+      setBusy(false);
+    });
+  }
+
+  function prepareFile(file) {
+    var type = file.type || '';
+    if (type === 'application/pdf') {
+      if (file.size > MAX_PDF_BYTES) return Promise.reject(new Error('「' + file.name + '」は5MBを超えているため添付できません。'));
+      return readDataUrl(file).then(function (d) {
+        return { name: file.name, mime: 'application/pdf', base64: d.split(',')[1] };
+      });
+    }
+    if (type.indexOf('image/') === 0) {
+      return readDataUrl(file).then(function (d) {
+        return shrinkImage(d, 1600, 0.82);
+      }).then(function (b64) {
+        var base = (file.name || 'image').replace(/\.[^.]+$/, '');
+        return { name: base + '.jpg', mime: 'image/jpeg', base64: b64 };
+      });
+    }
+    return Promise.reject(new Error('「' + file.name + '」は添付できない形式です。画像かPDFを選んでください。'));
+  }
+
+  function readDataUrl(file) {
+    return new Promise(function (resolve, reject) {
+      var r = new FileReader();
+      r.onload = function () { resolve(r.result); };
+      r.onerror = function () { reject(new Error('ファイルを読み込めませんでした。')); };
+      r.readAsDataURL(file);
+    });
+  }
+
+  // アイコン：中央を正方形に切り抜いて 512×512 の PNG にする
+  function keepAppName() {
+    var n = document.getElementById('as-name');
+    if (n) state.appNameDraft = n.value;
+    var form = n && n.form;
+    if (form) {
+      state.appFeatDraft = {};
+      Object.keys(FEATURE_NAMES).forEach(function (k) { var c = form['feat_' + k]; if (c) state.appFeatDraft[k] = c.checked; });
+    }
+  }
+  function pickAppIcon(input) {
+    var file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    keepAppName();
+    readDataUrl(file).then(function (url) {
+      return new Promise(function (resolve, reject) {
+        var img = new Image();
+        img.onload = function () {
+          var w = img.naturalWidth, h = img.naturalHeight, side = Math.min(w, h);
+          var c = document.createElement('canvas');
+          c.width = 512; c.height = 512;
+          var ctx = c.getContext('2d');
+          ctx.fillStyle = '#FFFFFF';
+          ctx.fillRect(0, 0, 512, 512);
+          ctx.drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, 512, 512);
+          // 画面表示用の小さい版（192px・JPEG）
+          var s2 = document.createElement('canvas');
+          s2.width = 192; s2.height = 192;
+          s2.getContext('2d').drawImage(c, 0, 0, 192, 192);
+          state.appIconSmall = s2.toDataURL('image/jpeg', 0.88).split(',')[1];
+          resolve(c.toDataURL('image/png').split(',')[1]);
+        };
+        img.onerror = function () { reject(new Error('この画像は読み込めませんでした。JPGかPNGでお試しください。')); };
+        img.src = url;
+      });
+    }).then(function (b64) {
+      state.appIcon = b64;
+      state.appIconRemove = false;
+      render();
+    }).catch(function (e) { toast(e.message, true); });
+  }
+
+  function shrinkImage(dataUrl, max, quality) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () {
+        var w = img.naturalWidth, h = img.naturalHeight;
+        var s = Math.min(1, max / Math.max(w, h));
+        w = Math.round(w * s);
+        h = Math.round(h * s);
+        var c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        var ctx = c.getContext('2d');
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(c.toDataURL('image/jpeg', quality).split(',')[1]);
+      };
+      img.onerror = function () { reject(new Error('この画像は読み込めませんでした。JPGかPNGでお試しください。')); };
+      img.src = dataUrl;
+    });
+  }
+
+  // 表示用：画像はサムネイル、PDFはファイル名
+  function filesView(files) {
+    if (!files || !files.length) return '';
+    files.forEach(function (f) { fileMeta[f.id] = f; });
+    var imgs = files.filter(isImage);
+    var docs = files.filter(function (f) { return !isImage(f); });
+    var html = '';
+    if (imgs.length) {
+      html += '<div class="att-grid">' + imgs.map(function (f) {
+        return '<button type="button" class="att-thumb" data-action="viewFile" data-id="' + esc(f.id) + '" aria-label="' + esc(f.name) + 'を拡大">' +
+          '<img data-file-img="' + esc(f.id) + '" alt="' + esc(f.name) + '"></button>';
+      }).join('') + '</div>';
+    }
+    html += docs.map(function (f) {
+      return '<button type="button" class="att-doc" data-action="viewFile" data-id="' + esc(f.id) + '">' + ficon('pdf', 22) +
+        '<span class="att-name">' + esc(f.name) + '</span><span class="muted small">' + fmtSize(f.size) + '</span></button>';
+    }).join('');
+    return '<div class="att-view">' + html + '</div>';
+  }
+
+  function loadFile(id) {
+    if (!fileCache[id]) {
+      fileCache[id] = call('api_getFile', state.token, id).then(function (r) {
+        var bin = atob(r.data);
+        var arr = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        var url = URL.createObjectURL(new Blob([arr], { type: r.mime }));
+        return { url: url, name: r.name, mime: r.mime, bytes: arr };
+      });
+      fileCache[id].catch(function () { delete fileCache[id]; });
+    }
+    return fileCache[id];
+  }
+
+  function hydrateImages() {
+    var imgs = $app.querySelectorAll('img[data-file-img]');
+    Array.prototype.forEach.call(imgs, function (img) {
+      loadFile(img.getAttribute('data-file-img')).then(function (f) {
+        img.src = f.url;
+      }, function () {
+        img.alt = '読み込めませんでした';
+      });
+    });
+  }
+
+  var $viewer = null;
+  function openViewer(html) {
+    if (!$viewer) {
+      $viewer = document.createElement('div');
+      $viewer.className = 'viewer';
+      $viewer.setAttribute('role', 'dialog');
+      $viewer.setAttribute('aria-modal', 'true');
+      document.body.appendChild($viewer);
+    }
+    $viewer.innerHTML = '<button type="button" class="viewer-close" data-action="closeViewer" aria-label="閉じる">×</button>' + html;
+    $viewer.hidden = false;
+  }
+  function closeViewer() {
+    if (pdfView) {
+      try { pdfView.doc.destroy(); } catch (e) {}
+      pdfView = null;
+    }
+    if ($viewer) {
+      $viewer.hidden = true;
+      $viewer.innerHTML = '';
+      $viewer.className = 'viewer';
+    }
+  }
+
+  // ---------- PDFをアプリ内で表示（PDF.js） ----------
+  var PDFJS_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+  var PDFJS_WORKER_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  var PDFJS_ASSETS_URL = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/';
+  var PDF_ZOOMS = [1, 1.5, 2];
+  var pdfjsPromise = null;
+  var pdfView = null;   // { doc, name, url, zoomIndex, gen }
+  var pdfGen = 0;
+
+  function loadPdfJs() {
+    if (!pdfjsPromise) {
+      pdfjsPromise = new Promise(function (resolve, reject) {
+        if (window.pdfjsLib) {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+          resolve(window.pdfjsLib);
+          return;
+        }
+        var s = document.createElement('script');
+        s.src = PDFJS_URL;
+        s.onload = function () {
+          if (!window.pdfjsLib) { reject(new Error('PDFを表示する準備に失敗しました。')); return; }
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+          resolve(window.pdfjsLib);
+        };
+        s.onerror = function () { reject(new Error('PDFを表示する準備に失敗しました。通信状況を確認してください。')); };
+        document.head.appendChild(s);
+      });
+      pdfjsPromise.catch(function () { pdfjsPromise = null; });
+    }
+    return pdfjsPromise;
+  }
+
+  function viewPdf(id) {
+    var meta = fileMeta[id] || {};
+    var gen = ++pdfGen;
+    openViewer('<div class="viewer-body"><div class="spinner"></div></div>');
+    return Promise.all([loadFile(id), loadPdfJs()]).then(function (r) {
+      var f = r[0], lib = r[1];
+      return lib.getDocument({
+        data: f.bytes.slice(),
+        // 日本語フォントを埋め込んでいないPDFも正しく表示するための設定
+        cMapUrl: PDFJS_ASSETS_URL + 'cmaps/',
+        cMapPacked: true,
+        standardFontDataUrl: PDFJS_ASSETS_URL + 'standard_fonts/'
+      }).promise.then(function (doc) {
+        if (gen !== pdfGen || !$viewer || $viewer.hidden) { doc.destroy(); return; }
+        pdfView = { doc: doc, name: f.name || meta.name || 'PDF', url: f.url, zoomIndex: 0, gen: gen };
+        $viewer.className = 'viewer pdf-mode';
+        openViewer(
+          '<div class="pdfbar">' +
+            '<div class="pdf-title">' + esc(pdfView.name) + '<span class="pdf-count">' + doc.numPages + 'ページ</span></div>' +
+            '<div class="pdf-tools">' +
+              '<button type="button" data-action="pdfZoom" data-d="-1" aria-label="縮小">−</button>' +
+              '<span id="pdf-zoom">100%</span>' +
+              '<button type="button" data-action="pdfZoom" data-d="1" aria-label="拡大">＋</button>' +
+              '<a class="pdf-save" href="' + f.url + '" download="' + esc(pdfView.name) + '">保存</a>' +
+            '</div>' +
+          '</div>' +
+          '<div class="pdf-pages" id="pdf-pages"></div>'
+        );
+        return renderPdfPages(gen);
+      });
+    }).catch(function (e) {
+      if (gen !== pdfGen) return;
+      closeViewer();
+      handleError(e && e.name === 'InvalidPDFException' ? new Error('このPDFは開けませんでした。ファイルが壊れている可能性があります。') : e);
+    });
+  }
+
+  function renderPdfPages(gen) {
+    var box = document.getElementById('pdf-pages');
+    if (!box || !pdfView) return Promise.resolve();
+    var doc = pdfView.doc;
+    var dpr = window.devicePixelRatio || 1;
+    var targetW = Math.min(2000, Math.max(800, (box.clientWidth - 16) * Math.min(3, dpr * 1.5)));
+    var n = doc.numPages;
+    var chain = Promise.resolve();
+    for (var i = 1; i <= n; i++) {
+      (function (num) {
+        chain = chain.then(function () {
+          if (!pdfView || pdfView.gen !== gen) return;
+          return doc.getPage(num).then(function (page) {
+            var base = page.getViewport({ scale: 1 });
+            var vp = page.getViewport({ scale: targetW / base.width });
+            var canvas = document.createElement('canvas');
+            canvas.width = Math.floor(vp.width);
+            canvas.height = Math.floor(vp.height);
+            canvas.className = 'pdf-page';
+            canvas.style.width = (PDF_ZOOMS[pdfView.zoomIndex] * 100) + '%';
+            canvas.setAttribute('aria-label', num + 'ページ目');
+            box.appendChild(canvas);
+            return page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+          });
+        });
+      })(i);
+    }
+    return chain;
+  }
+
+  function pdfZoom(d) {
+    if (!pdfView) return;
+    pdfView.zoomIndex = Math.max(0, Math.min(PDF_ZOOMS.length - 1, pdfView.zoomIndex + d));
+    var z = PDF_ZOOMS[pdfView.zoomIndex];
+    var label = document.getElementById('pdf-zoom');
+    if (label) label.textContent = Math.round(z * 100) + '%';
+    Array.prototype.forEach.call(document.querySelectorAll('#pdf-pages .pdf-page'), function (c) {
+      c.style.width = (z * 100) + '%';
+    });
+  }
+
+  function viewFile(id) {
+    var meta = fileMeta[id] || {};
+    if (isImage(meta)) {
+      openViewer('<div class="viewer-body"><div class="spinner"></div></div>');
+      return loadFile(id).then(function (f) {
+        openViewer('<div class="viewer-body"><img src="' + f.url + '" alt="' + esc(f.name) + '"></div>' +
+          '<div class="viewer-actions"><a class="btn small outline" href="' + f.url + '" download="' + esc(f.name) + '">保存</a></div>');
+      }, function (e) { closeViewer(); handleError(e); });
+    }
+    return viewPdf(id);
+  }
+
+  // ---------- アカウント ----------
+  function viewAccount() {
+    var u = state.user;
+    return '<form class="card stack" data-form="profile">' +
+        '<div class="section-title">プロフィール</div>' +
+        '<div class="field"><label>ログインID</label><div>' + esc(u.loginId) + '</div></div>' +
+        '<div class="field"><label for="p-name">表示名</label><input id="p-name" name="name" type="text" maxlength="30" value="' + esc(u.name) + '" required></div>' +
+        '<div class="field"><label for="p-mail">メールアドレス（任意）</label><input id="p-mail" name="email" type="email" value="' + esc(u.email) + '"></div>' +
+        '<button class="btn primary block" type="submit">保存する</button>' +
+      '</form>' +
+      '<form class="card stack" data-form="password">' +
+        '<div class="section-title">パスワードの変更</div>' +
+        '<div class="field"><label for="c-cur">現在のパスワード</label><input id="c-cur" name="current" type="password" autocomplete="current-password" required></div>' +
+        '<div class="field"><label for="c-new">新しいパスワード</label><input id="c-new" name="next" type="password" autocomplete="new-password" required><div class="hint">8文字以上</div></div>' +
+        '<div class="field"><label for="c-new2">新しいパスワード（確認）</label><input id="c-new2" name="next2" type="password" autocomplete="new-password" required></div>' +
+        '<button class="btn primary block" type="submit">変更する</button>' +
+      '</form>' +
+      '<div class="card stack">' +
+        '<div class="section-title">まとめメール</div>' +
+        '<div class="small muted">未読のメッセージ・掲示板や、区域カードの返却期限を、1日2回（7時・18時ごろ）メールでお知らせします。新しい未読がないときは送りません。</div>' +
+        (u.email
+          ? '<label class="check"><input type="checkbox" data-change="digest"' + (u.digest !== false ? ' checked' : '') + '>まとめメールを受け取る</label>' +
+            '<button class="btn outline block" data-action="digestTest">自分にテスト送信</button>'
+          : '<div class="hint">受け取るには、上の「メールアドレス」を登録してください。</div>') +
+      '</div>' +
+      '<button class="btn danger block" data-action="logout">ログアウト</button>' +
+      '<button class="linkbtn danger-text" data-action="withdraw">退会する</button>';
+  }
+
+  // ---------- 管理 ----------
+  function viewAdmin() {
+    var tabs = '<div class="seg seg3">' +
+      '<button data-action="adminTab" data-tab="members" class="' + (state.adminTab === 'members' ? 'on' : '') + '">メンバー（' + state.members.length + '）</button>' +
+      '<button data-action="adminTab" data-tab="invites" class="' + (state.adminTab === 'invites' ? 'on' : '') + '">招待コード</button>' +
+      '<button data-action="adminTab" data-tab="app" class="' + (state.adminTab === 'app' ? 'on' : '') + '">アプリ設定</button>' +
+    '</div>';
+    return tabs + (state.adminTab === 'members' ? viewMembers() : state.adminTab === 'app' ? viewAppSettings() : viewInvites());
+  }
+
+  function viewAppSettings() {
+    var a = state.appSettings;
+    if (!a) return '<div class="muted center">読み込み中…</div>';
+    var p = state.appIcon;   // 選んだばかりの新しいアイコン（まだ保存していない）
+    var src = p ? 'data:image/png;base64,' + p : (state.appIconRemove ? '' : a.iconUrl);
+    return '<form class="card stack" data-form="appSettings">' +
+        '<div class="field"><label for="as-name">アプリ名</label>' +
+          '<input id="as-name" name="name" type="text" maxlength="20" value="' + esc(state.appNameDraft != null ? state.appNameDraft : a.name) + '" required>' +
+          '<div class="hint">画面やメールに表示される名前です（20文字まで）。</div></div>' +
+        '<div class="field"><label>アイコン</label>' +
+          '<div class="icon-edit">' +
+            (src ? '<img class="icon-preview" src="' + esc(src) + '" alt="アイコン">' : '<div class="icon-preview logo">' + icon('group', 32) + '</div>') +
+            '<div class="stack">' +
+              '<label class="btn small outline">画像を選ぶ<input type="file" accept="image/*" data-upload="appIcon" hidden></label>' +
+              (src ? '<button type="button" class="btn small danger" data-action="removeAppIcon">アイコンを外す</button>' : '') +
+            '</div>' +
+          '</div>' +
+          '<div class="hint">正方形に切り抜いて使います。ロゴなどを中央に置いた画像がおすすめです。</div></div>' +
+        '<div class="field"><label>使う機能</label>' +
+          Object.keys(FEATURE_NAMES).map(function (k) {
+            var on = (state.appFeatDraft || a.features || {})[k] !== false;
+            return '<label class="check"><input type="checkbox" name="feat_' + k + '"' + (on ? ' checked' : '') + '>' + FEATURE_NAMES[k] + '</label>';
+          }).join('') +
+          '<div class="hint">オフにした機能は、メニューやホーム画面に表示されなくなります（データは消えません）。</div></div>' +
+        '<button class="btn primary block" type="submit">保存する</button>' +
+      '</form>' +
+      '<div class="notice small stack">' +
+        '<div>・アイコン画像だけは、ホーム画面のアイコンに使うため、URLを知っている人なら誰でも見られる設定でGoogleドライブに保存されます。</div>' +
+        '<div>・ホーム画面にすでに追加している場合、名前やアイコンは自動では変わりません。いったん削除して追加し直してください。</div>' +
+        '<div>・端末（とくにiPhone）によっては、アイコンが反映されないことがあります。</div>' +
+      '</div>';
+  }
+
+  function viewMembers() {
+    var html = '';
+    if (state.tempPw) {
+      html += '<div class="notice stack">' +
+        '<div><b>' + esc(state.tempPw.name) + '</b>さん（ID：' + esc(state.tempPw.loginId) + '）の仮パスワード</div>' +
+        '<div class="code-big">' + esc(state.tempPw.tempPassword) + '</div>' +
+        '<div class="small">本人に伝え、ログイン後に「アカウント」から変更してもらってください。この画面を離れると再表示できません。</div>' +
+        '<button class="btn small outline" data-action="closeTemp">閉じる</button>' +
+      '</div>';
+    }
+    if (!state.members.length) return html + '<div class="muted center">読み込み中…</div>';
+    return html + state.members.map(memberCard).join('');
+  }
+
+  function memberCard(m) {
+    var self = state.user && m.id === state.user.id;
+    var badges = '';
+    if (m.role === 'admin') badges += '<span class="tag admin">全体管理者</span>';
+    if (m.territoryAdmin) badges += '<span class="tag terr">区域カード管理者</span>';
+    if (m.calendarEditor && m.role !== 'admin') badges += '<span class="tag cal">カレンダー編集者</span>';
+    if (!m.active) badges += '<span class="tag off">利用停止中</span>';
+    return '<div class="card member">' +
+      '<div class="member-head"><div class="avatar">' + esc((m.name || '?').slice(0, 1)) + '</div>' +
+        '<div><div class="member-name">' + esc(m.name) + (self ? '（あなた）' : '') + ' ' + badges + '</div>' +
+        '<div class="muted small">ID：' + esc(m.loginId) + ' ・ 最終ログイン ' + fmtDate(m.lastLoginAt) + '</div></div></div>' +
+      '<div class="controls">' +
+        '<div class="row"><label class="small" for="role-' + esc(m.id) + '">権限</label>' +
+          '<select id="role-' + esc(m.id) + '" data-change="role" data-id="' + esc(m.id) + '"' + (self ? ' disabled' : '') + '>' +
+            '<option value="member"' + (m.role !== 'admin' ? ' selected' : '') + '>一般メンバー</option>' +
+            '<option value="admin"' + (m.role === 'admin' ? ' selected' : '') + '>全体管理者</option>' +
+          '</select></div>' +
+        '<label class="check"><input type="checkbox" data-change="territory" data-id="' + esc(m.id) + '"' + (m.territoryAdmin ? ' checked' : '') + '>区域カード管理者に任命</label>' +
+        (m.role === 'admin'
+          ? '<div class="muted small">全体管理者は予定の追加・変更もできます</div>'
+          : '<label class="check"><input type="checkbox" data-change="calendar" data-id="' + esc(m.id) + '"' + (m.calendarEditor ? ' checked' : '') + '>カレンダー編集者に任命（全体の予定を追加・変更できる）</label>') +
+        '<div class="row">' +
+          '<button class="btn small outline" data-action="resetPw" data-id="' + esc(m.id) + '">パスワード再設定</button>' +
+          '<button class="btn small ' + (m.active ? 'danger' : 'outline') + '" data-action="toggleActive" data-id="' + esc(m.id) + '"' + (self ? ' disabled' : '') + '>' + (m.active ? '利用停止' : '利用再開') + '</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function viewInvites() {
+    var html = '<form class="card stack" data-form="invite">' +
+      '<div class="section-title">招待コードを発行</div>' +
+      '<div class="field"><label for="i-role">権限</label><select id="i-role" name="role"><option value="member">一般メンバー</option><option value="admin">全体管理者</option></select></div>' +
+      '<div class="field"><label for="i-days">有効期限</label><select id="i-days" name="days"><option value="3">3日</option><option value="7">7日</option><option value="14" selected>14日</option><option value="30">30日</option></select></div>' +
+      '<div class="field"><label for="i-note">メモ（任意）</label><input id="i-note" name="note" type="text" maxlength="40" placeholder="例：山田さん用"><div class="hint">誰に渡したコードかを管理するためのメモです</div></div>' +
+      '<button class="btn primary block" type="submit">発行する</button>' +
+    '</form>';
+
+    if (state.lastInvite) {
+      var inv = state.lastInvite;
+      var msg = APP_NAME + 'への招待です。\n招待コード：' + inv.code + '\n有効期限：' + fmtDay(inv.expiresAt) + 'まで\n登録はこちら：' + inv.url;
+      html += '<div class="card stack">' +
+        '<div class="section-title">発行しました</div>' +
+        '<div class="code-big">' + esc(inv.code) + '</div>' +
+        '<div class="field"><label for="i-msg">送る文章（コピーしてLINEやメールで送れます）</label><textarea id="i-msg" readonly>' + esc(msg) + '</textarea></div>' +
+        '<button class="btn outline block" data-action="copyInvite">文章をコピー</button>' +
+      '</div>';
+    }
+
+    var list = state.invites.map(function (r) {
+      var status;
+      if (r.status === 'used') status = '使用済み：' + esc(r.usedByName || '');
+      else if (r.status === 'expired') status = '期限切れ';
+      else status = '未使用 ・ ' + fmtDay(r.expiresAt) + 'まで';
+      var role = r.role === 'admin' ? ' <span class="tag admin">管理者</span>' : '';
+      var revoke = r.status === 'open' ? '<button class="btn small danger" data-action="revoke" data-code="' + esc(r.code) + '">取り消し</button>' : '';
+      return '<div class="invite"><div><div class="code">' + esc(r.code) + role + '</div>' +
+        '<div class="muted small">' + status + (r.note ? ' ・ ' + esc(r.note) : '') + '</div></div>' + revoke + '</div>';
+    }).join('');
+
+    html += '<div class="card"><div class="section-title">発行済みのコード</div>' +
+      (list || '<div class="muted small" style="padding-top:8px">まだありません</div>') + '</div>';
+    return html;
+  }
+
+  function loadAdmin() {
+    return Promise.all([
+      call('api_listMembers', state.token),
+      call('api_listInvites', state.token)
+    ]).then(function (r) {
+      state.members = r[0];
+      state.invites = r[1];
+      if (state.screen === 'admin') render();
+    }, handleError);
+  }
+
+  // ---------- 操作 ----------
+  function afterAuth(r) {
+    state.token = r.token;
+    state.user = r.user;
+    store.set(r.token);
+    cache.clear();          // 別の人の表示内容が残らないように
+    cache.set('user', r.user);
+    go('home');
+  }
+
+  var forms = {
+    login: function (f) {
+      return run('api_login', f.loginId.value, f.password.value).then(afterAuth);
+    },
+    register: function (f) {
+      if (f.password.value !== f.password2.value) { toast('パスワード（確認）が一致しません。', true); return Promise.resolve(); }
+      return run('api_register', f.code.value, f.loginId.value, f.name.value, f.password.value, f.email.value).then(function (r) {
+        toast('登録しました。ようこそ！');
+        afterAuth(r);
+      });
+    },
+    appSettings: function (f) {
+      var feats = {};
+      Object.keys(FEATURE_NAMES).forEach(function (k) { feats[k] = !!(f['feat_' + k] && f['feat_' + k].checked); });
+      return run('api_saveAppSettings', state.token, f.name.value, state.appIcon || '', state.appIconRemove, state.appIconSmall || '', feats).then(function (a) {
+        state.user.features = a.features;
+        cache.set('user', state.user);
+        state.appFeatDraft = null;
+        state.appSettings = a;
+        state.appIcon = null; state.appIconSmall = null; state.appIconRemove = false; state.appNameDraft = null;
+        APP_NAME = a.name;
+        ICON_URL = a.iconUrl;
+        toast('保存しました。アプリを開き直すと反映されます。');
+        render();
+      });
+    },
+    profile: function (f) {
+      return run('api_updateProfile', state.token, f.name.value, f.email.value).then(function (u) {
+        state.user = u;
+        cache.set('user', u);
+        toast('保存しました。');
+        render();
+      });
+    },
+    password: function (f) {
+      if (f.next.value !== f.next2.value) { toast('新しいパスワード（確認）が一致しません。', true); return Promise.resolve(); }
+      return run('api_changePassword', state.token, f.current.value, f.next.value).then(function () {
+        toast('パスワードを変更しました。');
+        f.reset();
+      });
+    },
+    invite: function (f) {
+      return run('api_createInvite', state.token, f.role.value, f.days.value, f.note.value).then(function (inv) {
+        state.lastInvite = inv;
+        return loadAdmin();
+      });
+    },
+    post: function (f) {
+      var c = state.compose;
+      var important = !!(f.important && f.important.checked);
+      var fileIds = c.files.map(function (x) { return x.id; });
+      if (c.mode === 'edit') {
+        return run('api_updatePost', state.token, c.post.id, f.title.value, f.body.value, important, fileIds).then(function () {
+          toast('保存しました。');
+          openPost(c.post.id);
+        });
+      }
+      var sendMail = !!(f.sendMail && f.sendMail.checked);
+      if (sendMail && !confirm('メールでも送信します。よろしいですか？')) return Promise.resolve();
+      var gid = c.pickGroup && f.group ? f.group.value : (c.groupId || '');
+      return run('api_createPost', state.token, c.type, f.title.value, f.body.value, important, sendMail, fileIds, gid).then(function (r) {
+        toast(r.mail ? '投稿しました。' + r.mail.message : '投稿しました。', !!(r.mail && r.mail.sent === 0));
+        openPost(r.id);
+      });
+    },
+    event: function (fm) {
+      var f = state.eventForm;
+      var wds = Array.prototype.map.call(fm.querySelectorAll('input[name=wd]:checked'), function (x) { return Number(x.value); });
+      var repeat = fm.repeat ? fm.repeat.value : 'none';
+      if (repeat === 'weekly' && !wds.length) { toast('曜日を1つ以上選んでください。', true); return Promise.resolve(); }
+      var data = {
+        id: f.ev ? f.ev.id : '',
+        title: fm.title.value,
+        date: fm.date.value,
+        allDay: fm.allDay.checked,
+        startTime: fm.startTime.value,
+        endTime: fm.endTime.value,
+        location: fm.location.value,
+        memo: fm.memo.value,
+        repeat: repeat,
+        weekdays: wds,
+        until: fm.until ? fm.until.value : '',
+        groupId: f.fromGroup ? f.groupId : (fm.target ? fm.target.value : '')
+      };
+      return run('api_saveEvent', state.token, data, f.mode, f.date).then(function () {
+        toast('保存しました。');
+        if (f.fromGroup || (state.eventBack === 'group' && f.mode !== 'new')) {
+          state.groupTab = 'calendar';
+          go('group');
+          return;
+        }
+        var d = parseYmd(data.date);
+        var c = ensureCal();
+        c.y = d.getFullYear();
+        c.m = d.getMonth();
+        c.sel = data.date;
+        go('calendar');
+      });
+    },
+    group: function (fm) {
+      var f = state.groupForm;
+      var feats = Array.prototype.map.call(fm.querySelectorAll('input[name=feature]:checked'), function (x) { return x.value; });
+      if (f.mode === 'edit') {
+        var gid = f.group.id;
+        return run('api_updateGroup', state.token, gid, fm.name.value, fm.description.value, feats).then(function () {
+          toast('保存しました。');
+          state.groups = null;
+          state.groupId = gid;
+          state.group = null;
+          go('group');
+        });
+      }
+      var members = Array.prototype.map.call(fm.querySelectorAll('input[name=member]:checked'), function (x) { return x.value; });
+      return run('api_createGroup', state.token, fm.name.value, fm.description.value, feats, members).then(function (gid) {
+        toast('グループを作成しました。');
+        state.groups = null;
+        state.groupId = gid;
+        state.group = null;
+        state.groupTab = feats[0] || 'members';
+        go('group');
+      });
+    },
+    addMembers: function (fm) {
+      var ids = Array.prototype.map.call(fm.querySelectorAll('input[name=member]:checked'), function (x) { return x.value; });
+      if (!ids.length) { toast('追加するメンバーを選んでください。', true); return Promise.resolve(); }
+      return run('api_addGroupMembers', state.token, state.group.group.id, ids).then(function (n) {
+        toast(n + '人を追加しました。');
+        state.groupTab = 'members';
+        go('group');
+      });
+    },
+    chat: function (fm) {
+      var c = state.chat;
+      if (!c || c.sending) return Promise.resolve();
+      var body = fm.body.value;
+      var fileIds = c.files.map(function (x) { return x.id; });
+      if (!body.trim() && !fileIds.length) return Promise.resolve();
+      c.sending = true;
+      var btn = fm.querySelector('.composer-send');
+      if (btn) btn.disabled = true;
+      return call('api_sendMessage', state.token, c.convId, body, fileIds).then(function (r) {
+        c.sending = false;
+        if (!state.chat || state.chat.convId !== c.convId) return;
+        c.files = [];
+        var ta = document.getElementById('msg-body');
+        if (ta) { ta.value = ''; ta.style.height = ''; }
+        applyChat(r, true);
+      }, function (e) {
+        c.sending = false;
+        if (btn) btn.disabled = false;
+        handleError(e);
+      });
+    },
+    terrComment: function (fm) {
+      var c = state.terrCard;
+      return run('api_addTerritoryComment', state.token, c.id, fm.body.value, fm.warn.checked).then(function (list) {
+        c.comments = list;
+        c.commentCount = list.length;
+        c.warnCount = list.filter(function (x) { return x.warn; }).length;
+        render();
+        toast('コメントを残しました。');
+      });
+    },
+    dialog: function (fm) {
+      var vals = Array.prototype.map.call(fm.querySelectorAll('input,textarea'), function (x) { return x.value; });
+      closeFormDialog(vals);
+      return Promise.resolve();
+    },
+    dueDays: function (fm) {
+      return run('api_setDueDays', state.token, fm.days.value).then(function (d) {
+        state.terr.dueDays = d;
+        toast('返却期限を' + d + '日にしました。');
+        render();
+      });
+    },
+    availRange: function (fm) {
+      var a = normTerrLabel(fm.from.value), b = normTerrLabel(fm.to.value);
+      if (!a || !b) { toast('開始と終了の番号を「1」や「1-1」の形で入力してください。', true); return Promise.resolve(); }
+      // 枝番を省いた番号は、開始なら「その番号の最初」、終了なら「その番号の最後」とみなす
+      var ka = terrKey(a), kb = terrKey(b);
+      var lo = [ka[0], a.indexOf('-') >= 0 ? ka[1] : 0];
+      var hi = [kb[0], b.indexOf('-') >= 0 ? kb[1] : 9999];
+      if (lo[0] > hi[0] || (lo[0] === hi[0] && lo[1] > hi[1])) { var tmp = lo; lo = hi; hi = tmp; if (lo[1] === 9999) lo[1] = 0; if (hi[1] === 0) hi[1] = 9999; }
+      var inRange = function (k) {
+        return (k[0] > lo[0] || (k[0] === lo[0] && k[1] >= lo[1])) && (k[0] < hi[0] || (k[0] === hi[0] && k[1] <= hi[1]));
+      };
+      state.terrAdmin.selected = {};
+      state.terr.cards.forEach(function (c) { if (inRange(terrKey(c.number))) state.terrAdmin.selected[c.id] = true; });
+      var y = window.scrollY;
+      render();
+      window.scrollTo(0, y);
+      return Promise.resolve();
+    },
+    lendName: function (fm) {
+      var name = fm.name.value.trim();
+      if (!name) { toast('名前を入力してください。', true); return Promise.resolve(); }
+      return lendTerr('', name);
+    },
+    terrEdit: function (fm) {
+      var e = state.terrEdit;
+      var c = e.card;
+      if (c && c.type === 'map') {
+        return run('api_updateTerritory', state.token, c.id, fm.number.value, fm.name.value).then(function () {
+          toast('保存しました。');
+          openTerr(c.id, 'territory');
+        });
+      }
+      var url = fm.url.value.trim();
+      if (c && !url) {
+        return run('api_updateTerritory', state.token, c.id, fm.number.value, fm.name.value).then(function () {
+          toast('保存しました。');
+          openTerr(c.id, 'territory');
+        });
+      }
+      return run('api_saveListCard', state.token, c ? c.id : '', fm.number.value, fm.name.value, url).then(function (id) {
+        toast(c ? '保存しました。' : 'リスト型の区域を登録しました。');
+        state.terrAdmin = null;
+        openTerr(id, 'territory');
+      });
+    },
+    comment: function (f) {
+      var id = state.current.post.id;
+      var fileIds = state.commentFiles.map(function (x) { return x.id; });
+      return run('api_addComment', state.token, id, f.body.value, fileIds).then(function (list) {
+        state.current.comments = list;
+        state.commentFiles = [];
+        render();
+      });
+    }
+  };
+
+  var actions = {
+    digestTest: function () {
+      return run('api_sendDigestTest', state.token).then(function (to) {
+        toast(to + ' に送信しました。');
+      });
+    },
+    withdraw: function () {
+      return choose('退会しますか？\n・このアカウントではログインできなくなります\n・メールアドレスは削除され、メールも届かなくなります\n・グループからも抜けます\n・投稿・コメント・メッセージは「退会したメンバー」として残ります\n\nもう一度使うときは、新しい招待コードで登録し直してください（同じログインIDも使えます）。', [['ok', '退会の手続きへ', 'danger']]).then(function (k) {
+        if (!k) return;
+        return formDialog('確認のため、パスワードを入力してください', [{ label: 'パスワード', type: 'password' }], '退会する').then(function (v) {
+          if (!v) return;
+          return run('api_withdraw', state.token, v[0]).then(function () {
+            actions.logout();
+            toast('退会しました。ご利用ありがとうございました。');
+          });
+        });
+      });
+    },
+    logout: function () {
+      var t = state.token;
+      store.clear();
+      cache.clear();
+      state.token = null;
+      state.user = null;
+      state.summary = { unread: { board: 0, notice: 0 }, notices: [], upcoming: [] };
+      state.groups = null; state.group = null; state.inbox = null; state.users = null; state.chat = null;
+      state.posts = null; state.groupPosts = null; state.cal = null;
+      go('login');
+      if (t) call('api_logout', t).catch(function () {});
+    },
+    adminTab: function (el) {
+      state.adminTab = el.getAttribute('data-tab');
+      if (state.adminTab === 'app') {
+        state.appIcon = null; state.appIconSmall = null; state.appIconRemove = false; state.appNameDraft = null; state.appFeatDraft = null;
+        call('api_getAppSettings', state.token).then(function (a) {
+          state.appSettings = a;
+          if (state.screen === 'admin') render();
+        }, handleError);
+      }
+      render();
+    },
+    removeAppIcon: function () {
+      keepAppName();
+      state.appIcon = null; state.appIconSmall = null;
+      state.appIconRemove = true;
+      render();
+    },
+    closeTemp: function () {
+      state.tempPw = null;
+      render();
+    },
+    resetPw: function (el) {
+      var m = findMember(el.getAttribute('data-id'));
+      if (!m || !confirm(m.name + 'さんのパスワードを再設定しますか？\n仮パスワードを発行します。')) return;
+      return run('api_resetPassword', state.token, m.id).then(function (r) {
+        state.tempPw = r;
+        render();
+        window.scrollTo(0, 0);
+      });
+    },
+    toggleActive: function (el) {
+      var m = findMember(el.getAttribute('data-id'));
+      if (!m) return;
+      var msg = m.active ? m.name + 'さんを利用停止にしますか？\nログインできなくなります。' : m.name + 'さんの利用を再開しますか？';
+      if (!confirm(msg)) return;
+      return updateMember(m.id, { active: !m.active });
+    },
+    copyInvite: function () {
+      var ta = document.getElementById('i-msg');
+      if (!ta) return;
+      var done = function () { toast('コピーしました。'); };
+      var fail = function () { toast('コピーできませんでした。文章を長押しして選択してください。', true); };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(ta.value).then(done, function () { if (fallbackCopy(ta)) done(); else fail(); });
+      } else if (fallbackCopy(ta)) done(); else fail();
+    },
+    revoke: function (el) {
+      var code = el.getAttribute('data-code');
+      if (!confirm('招待コード ' + code + ' を取り消しますか？')) return;
+      return run('api_revokeInvite', state.token, code).then(loadAdmin);
+    },
+    // 掲示板
+    boardTab: function (el) {
+      state.boardTab = el.getAttribute('data-tab');
+      loadPosts();
+    },
+    toNotices: function () {
+      state.boardTab = 'notice';
+      go('board');
+    },
+    openPost: function (el) {
+      return openPost(el.getAttribute('data-id'));
+    },
+    newPost: function () {
+      var grp = state.boardTab === 'groups';
+      state.compose = { mode: 'new', type: grp ? 'board' : state.boardTab, post: null, files: [], groupId: '', pickGroup: grp };
+      state.postFrom = 'board';
+      go('compose');
+    },
+    newGroupPost: function () {
+      state.compose = { mode: 'new', type: 'board', post: null, files: [], groupId: state.group.group.id };
+      state.postFrom = 'group';
+      go('compose');
+    },
+    editPost: function () {
+      var p = state.current.post;
+      state.compose = { mode: 'edit', type: p.type, post: p, files: (p.files || []).slice() };
+      go('compose');
+    },
+    // グループ
+    newGroup: function () {
+      state.groupForm = { mode: 'new', selected: {} };
+      go('groupForm');
+      loadUsers();
+    },
+    openGroup: function (el) {
+      openGroup(el.getAttribute('data-id'));
+    },
+    groupTab: function (el) {
+      state.groupTab = el.getAttribute('data-tab');
+      if (state.groupTab === 'chat' && state.group && state.group.group) {
+        // チャットのタブは、そのままトーク画面を開く
+        openChat('g_' + state.group.group.id, 'group');
+        return;
+      }
+      render();
+      loadGroupTab();
+    },
+    newGroupEvent: function () {
+      openEventForm('new', null, todayStr(), state.group.group.id);
+    },
+    editGroup: function () {
+      state.groupForm = { mode: 'edit', group: state.group.group };
+      go('groupForm');
+    },
+    addGroupMembers: function () {
+      state.picker = { mode: 'addMembers', title: 'メンバーを追加', back: 'group' };
+      go('pickUsers');
+      state.users = null;   // 最新のメンバー一覧を取り直す
+      loadUsers();
+    },
+    setGroupRole: function (el) {
+      var role = el.getAttribute('data-role');
+      return run('api_setGroupRole', state.token, state.group.group.id, el.getAttribute('data-id'), role).then(function () {
+        toast(role === 'leader' ? '責任者にしました。' : '責任者から外しました。');
+        go('group');
+      });
+    },
+    removeGroupMember: function (el) {
+      var id = el.getAttribute('data-id');
+      var m = state.group.members.filter(function (x) { return x.id === id; })[0];
+      return choose((m ? m.name + 'さん' : 'このメンバー') + 'をグループから外しますか？', [['ok', '外す', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_removeGroupMember', state.token, state.group.group.id, id).then(function () {
+          toast('外しました。');
+          go('group');
+        });
+      });
+    },
+    leaveGroup: function () {
+      var g = state.group.group;
+      return choose('「' + g.name + '」から抜けますか？', [['ok', '抜ける', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_removeGroupMember', state.token, g.id, state.user.id).then(function () {
+          toast('グループから抜けました。');
+          state.groups = null;
+          go('groups');
+        });
+      });
+    },
+    deleteGroup: function () {
+      var g = state.group.group;
+      return choose('「' + g.name + '」を削除しますか？\nグループの投稿・予定・チャットは見られなくなります。', [['ok', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteGroup', state.token, g.id).then(function () {
+          toast('グループを削除しました。');
+          state.groups = null;
+          go('groups');
+        });
+      });
+    },
+    // メッセージ
+    newDm: function () {
+      state.picker = { mode: 'dm', title: '相手を選ぶ', back: 'inbox' };
+      go('pickUsers');
+      loadUsers();
+    },
+    startDm: function (el) {
+      return run('api_openDm', state.token, el.getAttribute('data-id')).then(function (convId) {
+        openChat(convId, 'inbox');
+      });
+    },
+    openChat: function (el) {
+      return openChat(el.getAttribute('data-id'));
+    },
+    msgMenu: function (el) {
+      var id = el.getAttribute('data-id');
+      return choose('このメッセージを削除しますか？', [['del', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteMessage', state.token, id).then(function (r) { applyChat(r, false); });
+      });
+    },
+    // 区域カード
+    openTerr: function (el) {
+      return openTerr(el.getAttribute('data-id'));
+    },
+    borrowTerr: function (el) {
+      var id = el.getAttribute('data-id');
+      var c = (state.terr && state.terr.cards || []).filter(function (x) { return x.id === id; })[0] || state.terrCard;
+      return choose((c ? terrTitle(c) : 'この区域') + 'を借りますか？', [['ok', '借りる', 'primary']]).then(function (k) {
+        if (!k) return;
+        return run('api_borrowTerritory', state.token, id).then(function () {
+          toast('借りました。返却期限は' + (state.terr ? state.terr.dueDays : '') + '日後です。');
+          refreshUnreadSoon();
+          if (state.screen === 'terrCard') return reloadTerrCard(id);
+          return loadTerritories();
+        });
+      });
+    },
+    returnTerr: function () {
+      var c = state.terrCard;
+      return formDialog(terrTitle(c) + 'を返却します', [
+        { label: '最後に使った日', type: 'date', value: todayStr(), max: todayStr(), hint: '次に借りる人に「前回いつ使ったか」として表示されます。使わなかった場合は空欄にしてください' }
+      ], '返却する').then(function (v) {
+        if (!v) return;
+        return run('api_returnTerritory', state.token, c.id, v[0]).then(function () {
+          toast('返却しました。');
+          refreshUnreadSoon();
+          state.terrCard = null;
+          go(state.terrBack === 'terrAdmin' ? 'terrAdmin' : 'territory');
+        });
+      });
+    },
+    terrSeg: function (el) {
+      state.terrSeg = el.getAttribute('data-tab');
+      render();
+    },
+    terrTab: function (el) {
+      state.terrTab = el.getAttribute('data-tab');
+      render();
+    },
+    reloadTerr: function () {
+      return reloadTerrCard(state.terrCard.id).then(function () { toast('最新の内容にしました。'); });
+    },
+    inkTool: function (el) {
+      ink.tool = el.getAttribute('data-tool');
+      Array.prototype.forEach.call(document.querySelectorAll('.map-tools .tool[data-tool]'), function (b) {
+        b.classList.toggle('on', b.getAttribute('data-tool') === ink.tool);
+      });
+    },
+    inkColor: function (el) {
+      ink.color = el.getAttribute('data-color');
+      Array.prototype.forEach.call(document.querySelectorAll('.map-tools .color'), function (b) {
+        b.classList.toggle('on', b.getAttribute('data-color') === ink.color);
+      });
+      if (ink.tool === 'move' || ink.tool === 'erase') {
+        ink.tool = 'pen';
+        Array.prototype.forEach.call(document.querySelectorAll('.map-tools .tool[data-tool]'), function (b) {
+          b.classList.toggle('on', b.getAttribute('data-tool') === 'pen');
+        });
+      }
+    },
+    inkUndo: function () {
+      var h = ink.history.pop();
+      if (!h) { toast('元に戻せる操作はありません。'); return; }
+      if (h.op === 'add') {
+        var i = ink.items.indexOf(h.item);
+        if (i >= 0) ink.items.splice(i, 1);
+      } else {
+        ink.items.splice(Math.min(h.index, ink.items.length), 0, h.item);
+      }
+      inkChanged();
+      drawInk();
+    },
+    inkClear: function () {
+      return choose('この区域の地図の書き込みをすべて消しますか？', [['ok', 'すべて消す', 'danger']]).then(function (k) {
+        if (!k) return;
+        ink.items = [];
+        ink.history = [];
+        clearTimeout(ink.saveTimer);
+        saveInk();
+        drawInk();
+      });
+    },
+    mapZoom: function (el) {
+      var d = Number(el.getAttribute('data-d'));
+      var z = mapView.zoom;
+      var next = d > 0
+        ? (MAP_ZOOMS.filter(function (x) { return x > z + 0.01; })[0] || MAP_MAX_ZOOM)
+        : (MAP_ZOOMS.filter(function (x) { return x < z - 0.01; }).pop() || 1);
+      var wrap = document.getElementById('map-wrap');
+      if (!wrap) return;
+      var r = wrap.getBoundingClientRect();
+      zoomAt(next, r.left + r.width / 2, r.top + r.height / 2);
+    },
+    mapFull: function (el) {
+      var area = document.getElementById('map-area');
+      if (!area) return;
+      mapView.full = !mapView.full;
+      area.classList.toggle('full', mapView.full);
+      document.body.classList.toggle('map-full-open', mapView.full);
+      el.textContent = mapView.full ? '閉じる' : '全画面';
+      // 表示枠の大きさが変わるので、倍率と位置を合わせ直す
+      var keepZoom = mapView.zoom;
+      requestAnimationFrame(function () { applyMapZoom(keepZoom); });
+    },
+    listSheet: function (el) {
+      return loadListSheet(el.getAttribute('data-gid'));
+    },
+    reloadList: function () {
+      return loadListSheet(state.terrCard.list.gid).then(function () { toast('最新の内容にしました。'); });
+    },
+    editCell: function (el) {
+      var c = state.terrCard;
+      var r = Number(el.getAttribute('data-r')), col = Number(el.getAttribute('data-c'));
+      var old = c.list.rows[r][col] || '';
+      return formDialog((r + 1) + '行目「' + (c.list.header[col] || '') + '」', [{ label: '内容', type: 'textarea', value: old }], '保存する').then(function (v) {
+        if (!v || v[0] === old) return;
+        return run('api_listSetCell', state.token, c.id, r, col, v[0], old, c.list.gid).then(function (list) {
+          c.list = list;
+          render();
+          toast('保存しました。');
+        }, function () { return loadListSheet(c.list.gid); });
+      });
+    },
+    addListRow: function () {
+      var c = state.terrCard;
+      return formDialog('行を追加', c.list.header.map(function (h) { return { label: h || '（見出しなし）' }; }), '追加する').then(function (v) {
+        if (!v) return;
+        return run('api_listAddRow', state.token, c.id, v, c.list.gid).then(function (list) {
+          c.list = list;
+          render();
+          toast('行を追加しました。');
+        });
+      });
+    },
+    deleteTerrComment: function (el) {
+      var c = state.terrCard;
+      return choose('このコメントを削除しますか？', [['ok', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteTerritoryComment', state.token, el.getAttribute('data-id')).then(function (list) {
+          c.comments = list;
+          c.commentCount = list.length;
+          c.warnCount = list.filter(function (x) { return x.warn; }).length;
+          render();
+        });
+      });
+    },
+    dialogCancel: function () {
+      closeFormDialog(null);
+    },
+    lendTerr: function () {
+      go('terrLend');
+      state.users = null;
+      loadUsers().then(function () { if (state.screen === 'terrLend') render(); });
+    },
+    lendTo: function (el) {
+      return lendTerr(el.getAttribute('data-id'), '');
+    },
+    terrHistory: function () {
+      state.terrHistory = null;
+      go('terrHistory');
+      return call('api_territoryHistory', state.token, state.terrCard.id).then(function (h) {
+        state.terrHistory = h;
+        if (state.screen === 'terrHistory') render();
+      }, handleError);
+    },
+    editTerr: function () {
+      state.terrEdit = { card: state.terrCard };
+      go('terrEdit');
+    },
+    newListTerr: function () {
+      state.terrEdit = { card: null };
+      go('terrEdit');
+    },
+    deleteTerr: function () {
+      var c = state.terrEdit.card;
+      return choose(terrTitle(c) + 'を削除しますか？\n書き込み・コメントも見られなくなります。', [['ok', '削除する', 'danger']]).then(function (k) {
+        if (!k) return;
+        return run('api_deleteTerritory', state.token, c.id).then(function () {
+          toast('削除しました。');
+          state.terrAdmin = null;
+          go('terrAdmin');
+        });
+      });
+    },
+    toggleAvail: function (el) {
+      var id = el.getAttribute('data-id');
+      var a = state.terrAdmin;
+      a.selected[id] = !a.selected[id];
+      var y = window.scrollY;
+      render();
+      window.scrollTo(0, y);
+    },
+    toggleParent: function (el) {
+      // 親番号の行を開く・閉じる（画面全体は描き直さない）
+      var key = el.getAttribute('data-key');
+      terrOpen[key] = !terrOpen[key];
+      el.setAttribute('aria-expanded', String(!!terrOpen[key]));
+      var box = el.parentNode.querySelector('.terr-children');
+      if (box) box.hidden = !terrOpen[key];
+    },
+    toggleAvailParent: function (el) {
+      var p = el.getAttribute('data-parent');
+      var a = state.terrAdmin;
+      var list = state.terr.cards.filter(function (c) { return terrParent(c.number) === p; });
+      var allOn = list.every(function (c) { return a.selected[c.id]; });
+      list.forEach(function (c) { a.selected[c.id] = !allOn; });
+      var y = window.scrollY;
+      render();
+      window.scrollTo(0, y);
+    },
+    availNone: function () {
+      state.terrAdmin.selected = {};
+      render();
+    },
+    saveAvail: function () {
+      var a = state.terrAdmin;
+      var ids = Object.keys(a.selected).filter(function (k) { return a.selected[k]; });
+      return run('api_setAvailable', state.token, ids).then(function () {
+        toast('貸出対象を保存しました（' + ids.length + '枚）。');
+        // 画面の内容もすぐ保存した状態に合わせる
+        var set = {};
+        ids.forEach(function (id) { set[id] = true; });
+        state.terr.cards.forEach(function (c) { c.available = !!set[c.id]; });
+        cache.set('terr', state.terr);
+        loadTerritories();
+      });
+    },
+    // カレンダー
+    calMove: function (el) {
+      moveMonth(Number(el.getAttribute('data-d')));
+    },
+    calToday: function () {
+      var t = new Date();
+      var c = ensureCal();
+      var reload = c.y !== t.getFullYear() || c.m !== t.getMonth();
+      c.y = t.getFullYear();
+      c.m = t.getMonth();
+      c.sel = todayStr();
+      if (reload) loadCalendar(); else render();
+    },
+    calPick: function (el) {
+      var s = el.getAttribute('data-date');
+      var d = parseYmd(s);
+      var c = ensureCal();
+      c.sel = s;
+      if (d.getMonth() !== c.m || d.getFullYear() !== c.y) {
+        c.y = d.getFullYear();
+        c.m = d.getMonth();
+        loadCalendar();
+      } else {
+        render();
+      }
+    },
+    openEvent: function (el) {
+      var e = eventIndex[el.getAttribute('data-key')];
+      if (!e) return;
+      state.eventView = e;
+      state.eventBack = state.screen === 'group' ? 'group' : (state.screen === 'home' ? 'home' : 'calendar');
+      go('event');
+    },
+    newEvent: function () {
+      var c = ensureCal();
+      openEventForm('new', null, state.screen === 'calendar' ? c.sel : todayStr());
+    },
+    editEvent: function () {
+      var e = state.eventView;
+      if (e.repeat === 'none') { openEventForm('all', e, e.date); return; }
+      return choose('繰り返しの予定です。どの回を変更しますか？', REPEAT_SCOPES).then(function (k) {
+        if (k) openEventForm(k, e, e.date);
+      });
+    },
+    deleteEvent: function () {
+      var e = state.eventView;
+      var ask = e.repeat === 'none'
+        ? choose('「' + e.title + '」を削除しますか？', [['all', '削除する', 'danger']])
+        : choose('繰り返しの予定です。どの回を削除しますか？', REPEAT_SCOPES.map(function (o) { return [o[0], o[1], 'danger']; }));
+      return ask.then(function (k) {
+        if (!k) return;
+        return run('api_deleteEvent', state.token, e.id, k, e.date).then(function () {
+          toast('削除しました。');
+          if (state.eventBack === 'group') { state.groupTab = 'calendar'; go('group'); return; }
+          go('calendar');
+        });
+      });
+    },
+    choose: function (el) {
+      closeChoose(el.getAttribute('data-key'));
+    },
+    removeAtt: function (el) {
+      var target = el.getAttribute('data-target');
+      attFiles(target).splice(Number(el.getAttribute('data-i')), 1);
+      refreshAttList(target);
+    },
+    viewFile: function (el) {
+      return viewFile(el.getAttribute('data-id'));
+    },
+    closeViewer: function () {
+      closeViewer();
+    },
+    pdfZoom: function (el) {
+      pdfZoom(Number(el.getAttribute('data-d')));
+    },
+    backToPost: function () {
+      if (state.compose && state.compose.post) openPost(state.compose.post.id);
+      else go('board');
+    },
+    deletePost: function () {
+      var p = state.current.post;
+      if (!confirm('「' + p.title + '」を削除しますか？')) return;
+      return run('api_deletePost', state.token, p.id).then(function () {
+        toast('削除しました。');
+        if (p.groupId && state.postFrom === 'group') {
+          state.groupPosts = (state.groupPosts || []).filter(function (x) { return x.id !== p.id; });
+          state.groupTab = 'board';
+          go('group');
+          return;
+        }
+        var tabKey = p.groupId ? 'groups' : p.type;
+        var cached = cache.get('posts:' + tabKey);
+        if (cached) cache.set('posts:' + tabKey, cached.filter(function (x) { return x.id !== p.id; }));
+        state.boardTab = tabKey;
+        go('board');
+      });
+    },
+    deleteComment: function (el) {
+      if (!confirm('このコメントを削除しますか？')) return;
+      return run('api_deleteComment', state.token, el.getAttribute('data-id')).then(function (list) {
+        state.current.comments = list;
+        render();
+      });
+    }
+  };
+
+  function fallbackCopy(ta) {
+    try { ta.select(); return document.execCommand('copy'); } catch (e) { return false; }
+  }
+
+  function findMember(id) {
+    for (var i = 0; i < state.members.length; i++) if (state.members[i].id === id) return state.members[i];
+    return null;
+  }
+
+  function updateMember(id, changes) {
+    return run('api_updateMember', state.token, id, changes).then(function (m) {
+      for (var i = 0; i < state.members.length; i++) if (state.members[i].id === id) state.members[i] = m;
+      if (state.user && m.id === state.user.id) {
+        state.user.role = m.role;
+        state.user.territoryAdmin = m.territoryAdmin;
+        state.user.calendarEditor = m.calendarEditor;
+        cache.set('user', state.user);
+      }
+      toast('更新しました。');
+      render();
+    }, function () { render(); });
+  }
+
+  // ---------- イベント ----------
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    var name = f.getAttribute('data-form');
+    if (!name || !forms[name]) return;
+    e.preventDefault();
+    Promise.resolve(forms[name](f)).catch(function () {});
+  });
+
+  document.addEventListener('click', function (e) {
+    if ($viewer && e.target === $viewer) { closeViewer(); return; }
+    if (e.target.id === 'dlg') { if (formResolve) closeFormDialog(null); else closeChoose(null); return; }
+    // 本文中のリンクはそのまま開く
+    var link = e.target.closest('a[href]');
+    if (link && !link.hasAttribute('data-action') && !link.hasAttribute('data-go')) return;
+    var el = e.target.closest('[data-go],[data-action]');
+    if (!el || el.disabled) return;
+    var to = el.getAttribute('data-go');
+    if (to) { e.preventDefault(); go(to); return; }
+    var a = el.getAttribute('data-action');
+    if (actions[a]) {
+      e.preventDefault();
+      Promise.resolve(actions[a](el)).catch(function () {});
+    }
+  });
+
+  // 名前での絞り込み・入力欄の自動の高さ調整
+  document.addEventListener('input', function (e) {
+    var el = e.target;
+    if (el.getAttribute('data-filter') === 'terr') {
+      var tq = el.value.trim().toLowerCase();
+      var nq = normTerrLabel(tq);
+      var match = function (row) {
+        var name = (row.getAttribute('data-name') || '').toLowerCase();
+        if (!tq) return true;
+        if (nq) {
+          // 番号で探すとき：「3」は区域3とその枝番、「3-2」は区域3-2だけ
+          var no = name.split(' ')[0];
+          return no === nq || (nq.indexOf('-') < 0 && no.split('-')[0] === nq);
+        }
+        return name.indexOf(tq) >= 0;
+      };
+      Array.prototype.forEach.call(document.querySelectorAll('.terr-list'), function (list) {
+        Array.prototype.forEach.call(list.children, function (node) {
+          if (node.classList.contains('terr-row')) { node.hidden = !match(node); return; }
+          if (!node.classList.contains('terr-group')) return;
+          var any = false;
+          Array.prototype.forEach.call(node.querySelectorAll('.terr-row'), function (row) {
+            var ok = match(row);
+            row.hidden = !ok;
+            if (ok) any = true;
+          });
+          node.hidden = !any;
+          var box = node.querySelector('.terr-children');
+          var btn = node.querySelector('.terr-parent');
+          var open = tq ? true : !!terrOpen[btn.getAttribute('data-key')];
+          box.hidden = !open;
+          btn.setAttribute('aria-expanded', String(open));
+        });
+      });
+    }
+    if (el.getAttribute('data-filter') === 'users') {
+      var q = el.value.trim().toLowerCase();
+      var root = el.parentNode;
+      Array.prototype.forEach.call(root.querySelectorAll('.user-item'), function (item) {
+        var name = (item.getAttribute('data-name') || '').toLowerCase();
+        item.hidden = !!q && name.indexOf(q) < 0;
+      });
+    }
+    if (el.getAttribute('data-autogrow')) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+    }
+  });
+
+  document.addEventListener('change', function (e) {
+    var el = e.target;
+    if (el.getAttribute('data-upload') === 'terrBulk') { bulkUpload(el); return; }
+    if (el.getAttribute('data-upload') === 'terrReplace') { replaceMap(el); return; }
+    if (el.getAttribute('data-upload') === 'appIcon') { pickAppIcon(el); return; }
+    if (el.getAttribute('data-upload')) { uploadSelected(el); return; }
+    var kind = el.getAttribute('data-change');
+    if (!kind) return;
+    var id = el.getAttribute('data-id');
+    if (kind === 'role') updateMember(id, { role: el.value }).catch(function () {});
+    if (kind === 'territory') updateMember(id, { territoryAdmin: el.checked }).catch(function () {});
+    if (kind === 'calendar') updateMember(id, { calendarEditor: el.checked }).catch(function () {});
+    if (kind === 'digest') {
+      var on = el.checked;
+      run('api_setDigest', state.token, on).then(function (u) {
+        state.user = u;
+        cache.set('user', u);
+        toast(on ? 'まとめメールを受け取ります。' : 'まとめメールを止めました。');
+      }).catch(function () { el.checked = !on; });
+    }
+    // 予定フォームの表示切り替え（入力内容を消さないよう、部分的に書き換える）
+    if (kind === 'evRepeat') {
+      var w = document.getElementById('ev-weekly');
+      var u = document.getElementById('ev-until');
+      if (w) w.hidden = el.value !== 'weekly';
+      if (u) u.hidden = el.value === 'none';
+    }
+    if (kind === 'evAllDay') {
+      var t = document.getElementById('ev-times');
+      if (t) t.hidden = el.checked;
+    }
+    if (kind === 'evDate' && el.value) {
+      var ml = monthLabels(el.value);
+      var md = document.getElementById('ev-opt-md');
+      var mn = document.getElementById('ev-opt-mn');
+      if (md) md.textContent = ml.date;
+      if (mn) mn.textContent = ml.nth;
+    }
+  });
+
+  // ---------- 起動 ----------
+  function init() {
+    var t = store.get();
+    if (!t) { go('login'); return; }
+    state.token = t;
+    // 前回の内容があれば、すぐにホームを表示する
+    var cachedUser = cache.get('user');
+    if (cachedUser) {
+      state.user = cachedUser;
+      state.summary = cache.get('summary') || state.summary;
+      state.screen = 'home';
+    }
+    render();
+    // ログイン確認とホームの情報を1回の通信で取得
+    call('api_bootstrap', t, todayStr()).then(function (r) {
+      state.user = r.user;
+      state.summary = r.summary;
+      cache.set('user', r.user);
+      cache.set('summary', r.summary);
+      if (state.screen === 'loading') state.screen = 'home';
+      if (state.screen === 'home') render();
+    }, function (e) {
+      if (errorText(e).indexOf('AUTH') >= 0) {
+        store.clear();
+        cache.clear();
+        state.token = null;
+        state.user = null;
+        go('login');
+      } else if (state.screen === 'loading') {
+        $app.innerHTML = '<div class="loading"><div>読み込みに失敗しました。通信状況を確認して、再読み込みしてください。</div></div>';
+      } else {
+        handleError(e);
+      }
+    });
+  }
+
+  init();
+})();
+</script>
